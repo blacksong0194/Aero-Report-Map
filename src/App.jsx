@@ -2581,7 +2581,7 @@ export default function App() {
     dashboard: <Dashboard incidents={incidents}/>,
     incidents:  <IncidentForm incidents={incidents} setIncidents={setIncidents} onViewReport={handleViewReport} logAudit={logAudit}/>,
     persons:    <PersonDossier incidents={incidents} onViewReport={handleViewReport}/>,
-    networkMap: <Suspense fallback={<div style={{padding:40,color:"#64748b",fontSize:13}}>Cargando mapa…</div>}><NetworkMap persons={persons} setPersons={setPersons} incidents={incidents} theme={theme} setTheme={setTheme} savedMaps={savedMaps} setSavedMaps={setSavedMaps}/></Suspense>,
+    networkMap: <Suspense fallback={<div style={{padding:40,color:"#64748b",fontSize:13}}>Cargando mapa…</div>}><NetworkMap persons={persons} setPersons={setPersons} incidents={incidents} theme={theme} setTheme={setTheme} savedMaps={savedMaps} setSavedMaps={setSavedMaps} aiResolved={resolveActiveAI(aiConfig)}/></Suspense>,
     scanner:    <OCRScanner watchlist={watchlist}/>,
     reports:    <ReportGenerator incidents={incidents} user={user} reportCounter={reportCounter} setReportCounter={setReportCounter} onPrintInc={printRef}/>,
     settings:   <SettingsPanel user={user} users={users} setUsers={setUsers} setUser={setUser} watchlist={watchlist} setWatchlist={setWatchlist} onDataRestored={handleDataRestored} audit={audit} logAudit={logAudit} aiConfig={aiConfig} setAiConfig={setAiConfig}/>,

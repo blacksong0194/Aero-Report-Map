@@ -205,7 +205,7 @@ function AddEventModal({ nodes, setEvents, setShowAddEvent, ROLE_COLORS }) {
   );
 }
 
-function NetworkMap({ persons: externalPersons, setPersons, incidents: externalIncidents, theme: externalTheme, setTheme: externalSetTheme, savedMaps = [], setSavedMaps }) {
+function NetworkMap({ persons: externalPersons, setPersons, incidents: externalIncidents, theme: externalTheme, setTheme: externalSetTheme, savedMaps = [], setSavedMaps, aiResolved }) {
   const [internalTheme, setInternalTheme] = useState('dark');
   const theme = externalTheme || internalTheme;
   const setTheme = externalSetTheme || setInternalTheme;
@@ -355,23 +355,25 @@ ${connectionsData}
 
 Responde en español con un análisis detallado en máximo 300 palabras.`;
 
-      // Llamar a Ollama local (llava o cualquier modelo de texto)
-      const response = await fetch('http://localhost:11434/api/generate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'llava',
-          prompt: prompt,
-          stream: false
-        })
+      // Usa el proveedor de IA configurado en Ajustes (Anthropic / OpenAI / Gemini / OpenRouter / compatible / Ollama)
+      if (!window.electronAPI || !window.electronAPI.aiRequest) {
+        throw new Error('IA no disponible en este entorno');
+      }
+      if (!aiResolved || (aiResolved.provider !== 'ollama' && !aiResolved.apiKey)) {
+        throw new Error('Configura un proveedor de IA y su clave en Configuración → IA / API');
+      }
+      const result = await window.electronAPI.aiRequest({
+        config: aiResolved,
+        messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
+        max_tokens: 800,
       });
-      
-      if (!response.ok) throw new Error('Ollama no disponible');
-      
-      const data = await response.json();
-      setAiAnalysis(data.response || 'Análisis completado');
+      if (!result.ok) {
+        throw new Error((result.data && result.data.error && result.data.error.message) || ('Error ' + result.status));
+      }
+      const text = ((result.data.content && result.data.content.find(c => c.type === 'text')) || result.data.content?.[0] || {}).text || '';
+      setAiAnalysis(text || 'Análisis completado');
     } catch (err) {
-      setAiAnalysis('Error: ' + err.message + '. Asegúrate de que Ollama esté ejecutándose en localhost:11434');
+      setAiAnalysis('Error: ' + err.message);
     }
     setAnalyzing(false);
   };
