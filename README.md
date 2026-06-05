@@ -203,7 +203,7 @@ MIT License
 
 # Autor
 
-AeroReport Pro
+blacksong0194
 
 ---
 
@@ -211,15 +211,14 @@ AeroReport Pro
 
 ## Dashboard
 
-*Agrega aquí screenshots*
+<img width="1919" height="1025" alt="image" src="https://github.com/user-attachments/assets/89d5424e-89f7-467a-835f-7a4f6ab8284f" />
+
 
 ## Mapa de relaciones
-
-*Agrega aquí screenshots*
+<img width="1915" height="1079" alt="image" src="https://github.com/user-attachments/assets/5e03774c-4a2d-431a-bce3-0851a57700a2" />
 
 ## OCR y vigilancia
-
-*Agrega aquí screenshots*
+<img width="1919" height="1079" alt="image" src="https://github.com/user-attachments/assets/3b41a9d1-4e49-46ea-bad7-09c975f482a1" />
 
 ---
 
