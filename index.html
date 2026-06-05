@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#f59e0b" />
+  <meta name="description" content="Sistema de Novedades Aeroportuarias — AeroReport Pro" />
+  <title>AeroReport Pro</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #root { height: 100%; width: 100%; }
+    body { background: #080c18; padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); overscroll-behavior: none; -webkit-overflow-scrolling: touch; }
+    #splash { position: fixed; inset: 0; background: #080c18; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 9999; transition: opacity 0.4s; }
+    #splash.hidden { opacity: 0; pointer-events: none; }
+    #splash-logo { font-size: 48px; margin-bottom: 16px; }
+    #splash-title { font-family: sans-serif; font-size: 20px; font-weight: 700; color: #f59e0b; letter-spacing: 2px; }
+    #splash-sub { font-family: sans-serif; font-size: 11px; color: #475569; margin-top: 6px; letter-spacing: 3px; text-transform: uppercase; }
+    #splash-bar { width: 160px; height: 3px; background: #1e2d4a; border-radius: 2px; margin-top: 24px; overflow: hidden; }
+    #splash-progress { height: 100%; background: #f59e0b; border-radius: 2px; animation: load 1.2s ease forwards; }
+    @keyframes load { from { width: 0 } to { width: 100% } }
+  </style>
+</head>
+<body>
+  <div id="splash">
+    <div id="splash-logo">✈</div>
+    <div id="splash-title">AEROREPORT PRO</div>
+    <div id="splash-sub">Sistema Operativo · SDQ</div>
+    <div id="splash-bar"><div id="splash-progress"></div></div>
+  </div>
+  <div id="root"></div>
+  <script type="module" src="/src/main.jsx"></script>
+  <script>
+    window.addEventListener('load', () => { setTimeout(() => { const splash = document.getElementById('splash'); if (splash) splash.classList.add('hidden'); }, 1400) });
+    let pwaPrompt = null;
+    window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); pwaPrompt = e; window.dispatchEvent(new CustomEvent('pwa-installable')); });
+    window.installPWA = async () => { if (!pwaPrompt) return 'not-available'; pwaPrompt.prompt(); const { outcome } = await pwaPrompt.userChoice; pwaPrompt = null; return outcome; };
+  </script>
+</body>
+</html>

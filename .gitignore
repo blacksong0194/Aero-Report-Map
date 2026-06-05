@@ -1,0 +1,21 @@
+# Dependencias
+node_modules/
+
+# Builds y salidas
+dist/
+dist-installer/
+release/
+install/
+build/icon.png
+
+# Logs y temporales
+*.log
+electron/app.log
+.DS_Store
+Thumbs.db
+*.tmp
+
+# Entorno / secretos
+.env
+electron-builder.env
+*.local

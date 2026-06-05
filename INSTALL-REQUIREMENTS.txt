@@ -1,0 +1,57 @@
+═══════════════════════════════════════════════════════════════════════════════
+                    AEROREPORT MAP - REQUISITOS DE INSTALACIÓN
+═══════════════════════════════════════════════════════════════════════════════
+
+Esta aplicación requiere los siguientes programas para funcionar correctamente
+con todas las opciones de IA y OCR:
+
+─────────────────────────────────────────────────────────────────────────────────────
+PROGRAMAS OBLIGATORIOS
+─────────────────────────────────────────────────────────────────────────────────────
+
+1. NODE.JS (v18 o superior)
+   └─ Requerido para ejecutar la aplicación Electron
+   └─ Descarga: https://nodejs.org/
+   └─ Instalación: Descargar e instalar la versión LTS
+
+─────────────────────────────────────────────────────────────────────────────────────
+PROGRAMAS OPCIONALES (IA LOCAL + OCR)
+─────────────────────────────────────────────────────────────────────────────────────
+
+2. LM STUDIO (para IA Local con Qwen)
+   └─ Modelo requerido: qwen2.5-vl-7b-instruct
+   └─ Descarga: https://lmstudio.ai/
+   └─ Instrucciones:
+      a) Descargar e instalar LM Studio
+      b) Buscar y descargar el modelo "qwen2.5-vl-7b-instruct" en la app
+      c) Cargar el modelo y mantener LM Studio abierto en el puerto 1234
+   └─ Nota: Si no se usa LM Studio, la app funcionará solo con OCR.space o Claude API
+
+3. ANTHROPIC API KEY (opcional, para IA en la nube)
+   └─ Provee: Claude Sonnet 4 (más preciso)
+   └─ Obtención: https://console.anthropic.com/
+   └─ Configuración: En Settingspanel de la app
+
+─────────────────────────────────────────────────────────────────────────────────────
+RESUMEN DE FUNCIONALIDADES
+─────────────────────────────────────────────────────────────────────────────────────
+
+MODO              │ REQUIERE          │ PRECISIÓN  │ INTERNET
+─────────────────┼──────────────────┼────────────┼──────────
+🤖 IA (Claude)   │ API Key Anthropic│ Alta      │ Sí
+🐋 Qwen (LM)     │ LM Studio        │ Media    │ No
+☁ OCR.space      │ Conexión internet│ Media    │ Sí
+Tesseract(local) │ Ninguno          │ Baja     │ No
+
+────────────────────────────────��────────────────────────────────────────────────────
+NOTAS IMPORTANTES
+─────────────────────────────────────────────────────────────────────────────────────
+
+• La aplicación funciona sin LM Studio pero con menos opciones de IA
+• OCR.space tiene 5000 scans gratuitos al mes
+• Para mejor precisión en documentos, usar Claude API
+• LM Studio requiere al menos 8GB de RAM y un procesador potente
+
+═══════════════════════════════════════════════════════════════════════════════
+                    AEROREPORT PRO - PUNTA CANA
+═══════════════════════════════════════════════════════════════════════════════

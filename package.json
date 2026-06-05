@@ -1,0 +1,74 @@
+{
+  "name": "aero-report-map",
+  "version": "1.0.0",
+  "description": "AeroReport Pro - Sistema de novedades aeroportuarias",
+  "main": "electron/main.js",
+  "author": "AeroReport Pro",
+  "license": "MIT",
+  "scripts": {
+    "dev": "vite",
+    "dev:desktop": "concurrently -n VITE,ELECTRON -c cyan,yellow \"vite\" \"wait-on tcp:5173 && cross-env ELECTRON=true electron .\"",
+    "build": "vite build",
+    "build:win": "npm run build && electron-builder --win --x64",
+    "build:linux": "npm run build && electron-builder --linux --x64",
+    "release": "npm run build && electron-builder --win --x64 --publish always",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "recharts": "^2.12.7",
+    "lucide-react": "^0.383.0",
+    "tesseract.js": "^5.1.1",
+    "paddleocr": "^1.1.1",
+    "jspdf": "^2.5.1",
+    "html2canvas": "^1.4.1",
+    "electron-updater": "^6.3.9"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "concurrently": "^8.2.2",
+    "cross-env": "^7.0.3",
+    "electron": "^31.3.1",
+    "electron-builder": "^24.13.3",
+    "vite": "^5.4.2",
+    "wait-on": "^7.2.0"
+  },
+  "build": {
+    "appId": "com.aeroreportmap.desktop",
+    "productName": "AeroReport Map",
+    "copyright": "Copyright 2025 AeroReport Pro",
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "blacksong0194",
+        "repo": "Aero-Report-Map"
+      }
+    ],
+    "directories": {
+      "output": "install",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "!electron/app.log"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ],
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "AeroReport Map"
+    }
+  }
+}
