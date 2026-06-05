@@ -1,8 +1,13 @@
 import { useState, useRef, useCallback, useEffect, lazy, Suspense } from "react";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, LineChart, Line } from "recharts";
-import { AlertTriangle, Shield, Plane, FileText, Camera, UploadCloud, CheckCircle, Clock, XCircle, User, LogOut, ChevronRight, Plus, Trash2, Eye, Search, Bell, BarChart2, Layers, Hash, Printer, Crop, Settings, KeyRound, UserPlus, ShieldCheck, EyeOff, Network } from "lucide-react";
+import { AlertTriangle, Shield, Plane, FileText, Camera, UploadCloud, CheckCircle, Clock, XCircle, User, Users, LogOut, ChevronRight, Plus, Trash2, Eye, Search, Bell, BarChart2, Layers, Hash, Printer, Crop, Settings, KeyRound, UserPlus, ShieldCheck, EyeOff, Network } from "lucide-react";
 // Carga diferida: NetworkMap arrastra jsPDF + html2canvas (pesados), solo se cargan al abrir el mapa
 const NetworkMap = lazy(() => import("./components/NetworkMap"));
+// Lógica pura extraída a módulos (testeada en src/lib/*.test.js)
+import { hashPassword, verifyPassword } from "./lib/security.js";
+import { buildReportNumber, todayStr } from "./lib/format.js";
+import { matchWatchlist } from "./lib/watchlist.js";
+import { parseMRZRobust } from "./lib/mrz.js";
 
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
 const COLORS = { primary: "#f59e0b", danger: "#ef4444", success: "#10b981", info: "#6366f1", warning: "#f97316" };
@@ -53,16 +58,44 @@ async function callOCRspace(imageBase64, language = "spa") {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Lee la API key de Anthropic guardada por el usuario en Configuración.
-// La clave NO vive en el código; el usuario la introduce desde el panel de Ajustes.
-const ANTHROPIC_KEY_STORE = "aeroreport_anthropic_key";
-function getStoredApiKey() {
-  try { return (localStorage.getItem(ANTHROPIC_KEY_STORE) || "").trim(); }
-  catch (e) { return ""; }
+// ─── CONFIGURACIÓN DE IA MULTI-PROVEEDOR ─────────────────────────────────────
+// Las claves NO viven en el código; el usuario elige proveedor y clave en Ajustes.
+const AI_PROVIDERS = ["anthropic","openai","gemini","openrouter","compatible","ollama"];
+const AI_PROVIDER_LABELS = {
+  anthropic:"Anthropic (Claude)", openai:"OpenAI (GPT-4o)", gemini:"Google Gemini",
+  openrouter:"OpenRouter", compatible:"Compatible OpenAI", ollama:"Ollama (local)",
+};
+const DEFAULT_AI = {
+  provider: "anthropic",
+  settings: {
+    anthropic:  { apiKey:"", model:"claude-sonnet-4-6" },
+    openai:     { apiKey:"", model:"gpt-4o" },
+    gemini:     { apiKey:"", model:"gemini-1.5-flash" },
+    openrouter: { apiKey:"", model:"openai/gpt-4o", baseUrl:"" },
+    compatible: { apiKey:"", model:"", baseUrl:"" },
+    ollama:     { apiKey:"", model:"llama3.2-vision", baseUrl:"http://localhost:11434/v1" },
+  },
+};
+function normalizeAIConfig(cfg) {
+  const base = JSON.parse(JSON.stringify(DEFAULT_AI));
+  if (!cfg) return base;
+  if (cfg.provider && AI_PROVIDERS.includes(cfg.provider)) base.provider = cfg.provider;
+  if (cfg.settings) for (const p of AI_PROVIDERS) base.settings[p] = { ...base.settings[p], ...(cfg.settings[p]||{}) };
+  return base;
 }
+function resolveActiveAI(cfg) {
+  const c = normalizeAIConfig(cfg);
+  const s = c.settings[c.provider] || {};
+  return { provider:c.provider, apiKey:s.apiKey||"", model:s.model||"", baseUrl:s.baseUrl||"" };
+}
+// Espejo a nivel de módulo para que callAnthropicAPI lo lea sin props
+let _activeAI = DEFAULT_AI;
+function setModuleAI(cfg) { _activeAI = normalizeAIConfig(cfg); }
+function getActiveProvider() { return _activeAI.provider; }
+function activeKeyConfigured() { const a = resolveActiveAI(_activeAI); return a.provider==="ollama" || !!a.apiKey; }
 
 async function callAnthropicAPI(model, max_tokens, messages) {
-  // LM Studio local model
+  // LM Studio local model (modo aparte del scanner)
   if (model.startsWith('lm:')) {
     const actualModel = model.replace('lm:', '');
     if (!window.electronAPI?.lmStudio) throw new Error('LM Studio no disponible');
@@ -70,15 +103,14 @@ async function callAnthropicAPI(model, max_tokens, messages) {
       .then(r => ({ content: [{ type: 'text', text: r.content }] }));
   }
 
-  const apiKey = getStoredApiKey();
-
-  // Anthropic via Electron
-  if (window.electronAPI && window.electronAPI.callAnthropic) {
-    const result = await window.electronAPI.callAnthropic({ model, max_tokens, messages, apiKey });
+  // IA multi-proveedor (Anthropic / OpenAI / Gemini / OpenRouter / compatible / Ollama)
+  if (window.electronAPI && window.electronAPI.aiRequest) {
+    const config = resolveActiveAI(_activeAI);
+    const result = await window.electronAPI.aiRequest({ config, messages, max_tokens });
     if (!result.ok) throw new Error("Error " + result.status + ": " + (result.data && result.data.error ? result.data.error.message : JSON.stringify(result.data)));
     return result.data;
   }
-  
+
   // Fallback web
   const isLocalhost = location.hostname === "localhost" || location.hostname === "127.0.0.1";
   if (isLocalhost) {
@@ -140,15 +172,7 @@ const S = {
   mono:     { fontFamily:"'JetBrains Mono',monospace", fontSize:12, color:"#64748b" },
 };
 
-// ─── REPORT NUMBER GENERATOR ──────────────────────────────────────────────────
-// Format: YYMMNN  (e.g. 260301 = year 26, month 03, seq 01)
-function buildReportNumber(counter) {
-  const now = new Date();
-  const yy = String(now.getFullYear()).slice(-2);
-  const mm = String(now.getMonth() + 1).padStart(2, "0");
-  const nn = String(counter).padStart(2, "0");
-  return yy + mm + nn;
-}
+// buildReportNumber y todayStr ahora viven en ./lib/format.js (importados arriba)
 
 // ─── CROP PHOTO TOOL ─────────────────────────────────────────────────────────
 function CropTool({ imgSrc, onCrop, onCancel }) {
@@ -443,7 +467,14 @@ function Login({ onLogin, users }) {
 function Dashboard({ incidents }) {
   const byArea = AREAS.map(a=>({ name:a.split(" ")[0], count:incidents.filter(i=>i.area===a).length }));
   const byStatus = STATUSES.map(s=>({ name:s, value:incidents.filter(i=>i.status===s).length, color:STATUS_COLOR[s] }));
-  const hourly = [7,8,9,10,11,12,13,14].map((h,i)=>({ hour:h+"h", events:[1,3,2,4,1,2,3,1][i] }));
+  // Actividad horaria real (desde el campo time HH:MM)
+  const hourCounts = {};
+  incidents.forEach(i=>{ if(i.time && /^\d{1,2}:/.test(i.time)){ const h=parseInt(i.time.split(":")[0],10); if(h>=0&&h<=23) hourCounts[h]=(hourCounts[h]||0)+1; } });
+  const hoursWithData = Object.keys(hourCounts).map(Number).sort((a,b)=>a-b);
+  const hourly = (hoursWithData.length?hoursWithData:[8,12,16]).map(h=>({ hour:h+"h", events:hourCounts[h]||0 }));
+  // Tendencia de los últimos 7 días (desde el campo date YYYY-MM-DD)
+  const trend = [];
+  for(let k=6;k>=0;k--){ const d=new Date(); d.setDate(d.getDate()-k); const ds=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; trend.push({ label:`${d.getDate()}/${d.getMonth()+1}`, count:incidents.filter(i=>i.date===ds).length }); }
   const critical = incidents.filter(i=>i.severity==="Crítica"||i.severity==="Alta").length;
   return (
     <div className="fade-in">
@@ -474,13 +505,23 @@ function Dashboard({ incidents }) {
           </div>
         </div>
       </div>
-      <div style={{...S.card,marginBottom:16}}><div style={{...S.h2,marginBottom:12}}>Actividad Horaria</div>
-        <ResponsiveContainer width="100%" height={90}><LineChart data={hourly}>
-          <XAxis dataKey="hour" tick={{fill:"#64748b",fontSize:10}} axisLine={false} tickLine={false}/>
-          <YAxis tick={{fill:"#64748b",fontSize:10}} axisLine={false} tickLine={false}/>
-          <Tooltip contentStyle={{background:"#0d1426",border:"1px solid #1e2d4a",borderRadius:8,color:"#e2e8f0",fontSize:12}}/>
-          <Line type="monotone" dataKey="events" stroke="#f59e0b" strokeWidth={2} dot={{fill:"#f59e0b",r:3}}/>
-        </LineChart></ResponsiveContainer>
+      <div style={{...S.grid2,marginBottom:16}}>
+        <div style={S.card}><div style={{...S.h2,marginBottom:12}}>Actividad Horaria</div>
+          <ResponsiveContainer width="100%" height={120}><LineChart data={hourly}>
+            <XAxis dataKey="hour" tick={{fill:"#64748b",fontSize:10}} axisLine={false} tickLine={false}/>
+            <YAxis allowDecimals={false} tick={{fill:"#64748b",fontSize:10}} axisLine={false} tickLine={false}/>
+            <Tooltip contentStyle={{background:"#0d1426",border:"1px solid #1e2d4a",borderRadius:8,color:"#e2e8f0",fontSize:12}}/>
+            <Line type="monotone" dataKey="events" stroke="#f59e0b" strokeWidth={2} dot={{fill:"#f59e0b",r:3}}/>
+          </LineChart></ResponsiveContainer>
+        </div>
+        <div style={S.card}><div style={{...S.h2,marginBottom:12}}>Tendencia (últimos 7 días)</div>
+          <ResponsiveContainer width="100%" height={120}><BarChart data={trend} margin={{top:0,right:0,left:-20,bottom:0}}>
+            <XAxis dataKey="label" tick={{fill:"#64748b",fontSize:10}} axisLine={false} tickLine={false}/>
+            <YAxis allowDecimals={false} tick={{fill:"#64748b",fontSize:10}} axisLine={false} tickLine={false}/>
+            <Tooltip contentStyle={{background:"#0d1426",border:"1px solid #1e2d4a",borderRadius:8,color:"#e2e8f0",fontSize:12}}/>
+            <Bar dataKey="count" fill="#6366f1" radius={[4,4,0,0]}/>
+          </BarChart></ResponsiveContainer>
+        </div>
       </div>
       <div style={S.card}><div style={{...S.flex,marginBottom:12,justifyContent:"space-between"}}><div style={S.h2}>Novedades Recientes</div></div>
         {incidents.slice(0,4).map(inc=>(
@@ -500,20 +541,34 @@ function Dashboard({ incidents }) {
 
 // ─── INCIDENT FORM ────────────────────────────────────────────────────────────
 function IncidentForm({ incidents, setIncidents, onViewReport, logAudit }) {
-  const empty = { reportName:"", time:"", area:AREAS[0], flightNumber:"", airline:"", origin:"", description:"", actions:"", status:STATUSES[0], severity:"Media", evidence:[], persons:[] };
+  const empty = { reportName:"", date:todayStr(), time:"", area:AREAS[0], flightNumber:"", airline:"", origin:"", description:"", actions:"", status:STATUSES[0], severity:"Media", evidence:[], persons:[] };
   const [form, setForm] = useState(empty);
   const [search, setSearch] = useState("");
   const [editing, setEditing] = useState(null);
   const [showScanner, setShowScanner] = useState(false);
+  const [formErr, setFormErr] = useState("");
   const evidenceRef = useRef();
 
-  const filtered = incidents.filter(i=>
-    ((i.reportName||"").toLowerCase().includes(search.toLowerCase()))||
-    i.description.toLowerCase().includes(search.toLowerCase())||
-    i.area.toLowerCase().includes(search.toLowerCase())
-  );
+  const [filters, setFilters] = useState({ area:"", severity:"", status:"", from:"", to:"" });
+  const setFil = k => e => setFilters(p=>({...p,[k]:e.target.value}));
+  const clearFilters = () => setFilters({ area:"", severity:"", status:"", from:"", to:"" });
+  const anyFilter = filters.area||filters.severity||filters.status||filters.from||filters.to;
+  const filtered = incidents.filter(i=>{
+    const q = search.toLowerCase();
+    const textOk = !q || (i.reportName||"").toLowerCase().includes(q) || (i.description||"").toLowerCase().includes(q) || (i.area||"").toLowerCase().includes(q);
+    const areaOk = !filters.area || i.area===filters.area;
+    const sevOk = !filters.severity || i.severity===filters.severity;
+    const statusOk = !filters.status || i.status===filters.status;
+    const d = i.date || "";
+    const fromOk = !filters.from || (d && d >= filters.from);
+    const toOk = !filters.to || (d && d <= filters.to);
+    return textOk && areaOk && sevOk && statusOk && fromOk && toOk;
+  });
   const save = () => {
-    if (!form.description||!form.time) return;
+    setFormErr("");
+    if (!form.description || !form.description.trim()) return setFormErr("La descripción de la novedad es obligatoria.");
+    if (!form.time) return setFormErr("La hora es obligatoria.");
+    if (!form.date) return setFormErr("La fecha es obligatoria.");
     const label = form.reportName || (form.area+" — "+form.time);
     if (editing!==null) { setIncidents(p=>p.map(i=>i.id===editing?{...form,id:editing}:i)); logAudit && logAudit("editar","novedad",label); }
     else { setIncidents(p=>[...p,{...form,id:Date.now()}]); logAudit && logAudit("crear","novedad",label); }
@@ -545,12 +600,15 @@ function IncidentForm({ incidents, setIncidents, onViewReport, logAudit }) {
                 <input style={{...S.input,borderColor:"#f59e0b40"}} placeholder="Ej: Pasajero no admitido — Kingston" value={form.reportName} onChange={set("reportName")}/>
               </div>
 
-              {/* Hora + Severidad */}
+              {/* Fecha + Hora */}
               <div style={S.grid2}>
+                <div><div style={{...S.label,marginBottom:5}}>Fecha</div><input style={S.input} type="date" value={form.date||""} onChange={set("date")}/></div>
                 <div><div style={{...S.label,marginBottom:5}}>Hora</div><input style={S.input} type="time" value={form.time} onChange={set("time")}/></div>
-                <div><div style={{...S.label,marginBottom:5}}>Severidad</div>
-                  <select style={S.select} value={form.severity} onChange={set("severity")}>{["Baja","Media","Alta","Crítica"].map(s=><option key={s}>{s}</option>)}</select>
-                </div>
+              </div>
+
+              {/* Severidad */}
+              <div><div style={{...S.label,marginBottom:5}}>Severidad</div>
+                <select style={S.select} value={form.severity} onChange={set("severity")}>{["Baja","Media","Alta","Crítica"].map(s=><option key={s}>{s}</option>)}</select>
               </div>
 
               {/* Área */}
@@ -646,9 +704,10 @@ function IncidentForm({ incidents, setIncidents, onViewReport, logAudit }) {
               </div>
 
               {/* Guardar */}
+              {formErr&&<div style={{background:"#ef444415",border:"1px solid #ef444430",borderRadius:8,padding:"8px 12px",fontSize:12,color:"#ef4444",display:"flex",alignItems:"center",gap:6}}><AlertTriangle size={13}/>{formErr}</div>}
               <div style={{display:"flex",gap:8,marginTop:4}}>
                 <button onClick={save} style={{...S.btn(),flex:1,justifyContent:"center"}}><Plus size={14}/>{editing!==null?"Actualizar Novedad":"Registrar Novedad"}</button>
-                {editing!==null&&<button onClick={()=>{setForm(empty);setEditing(null);setShowScanner(false);}} style={{...S.btn("ghost"),padding:"8px 12px"}}><XCircle size={14}/></button>}
+                {editing!==null&&<button onClick={()=>{setForm(empty);setEditing(null);setShowScanner(false);setFormErr("");}} style={{...S.btn("ghost"),padding:"8px 12px"}}><XCircle size={14}/></button>}
               </div>
             </div>
           </div>
@@ -656,9 +715,30 @@ function IncidentForm({ incidents, setIncidents, onViewReport, logAudit }) {
 
         {/* LIST */}
         <div style={{flex:1,minWidth:0}}>
-          <div style={{position:"relative",marginBottom:12}}>
+          <div style={{position:"relative",marginBottom:10}}>
             <input style={{...S.input,paddingLeft:32}} placeholder="Buscar por nombre, área o descripción..." value={search} onChange={e=>setSearch(e.target.value)}/>
             <Search size={13} color="#475569" style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)"}}/>
+          </div>
+          <div style={{...S.card,padding:"10px 12px",marginBottom:12}}>
+            <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"flex-end"}}>
+              <div style={{flex:"1 1 120px"}}><div style={{...S.label,marginBottom:4}}>Área</div>
+                <select style={{...S.select,padding:"6px 8px",fontSize:12}} value={filters.area} onChange={setFil("area")}><option value="">Todas</option>{AREAS.map(a=><option key={a} value={a}>{a}</option>)}</select>
+              </div>
+              <div style={{flex:"0 0 110px"}}><div style={{...S.label,marginBottom:4}}>Severidad</div>
+                <select style={{...S.select,padding:"6px 8px",fontSize:12}} value={filters.severity} onChange={setFil("severity")}><option value="">Todas</option>{["Baja","Media","Alta","Crítica"].map(s=><option key={s} value={s}>{s}</option>)}</select>
+              </div>
+              <div style={{flex:"0 0 120px"}}><div style={{...S.label,marginBottom:4}}>Estado</div>
+                <select style={{...S.select,padding:"6px 8px",fontSize:12}} value={filters.status} onChange={setFil("status")}><option value="">Todos</option>{STATUSES.map(s=><option key={s} value={s}>{s}</option>)}</select>
+              </div>
+              <div style={{flex:"0 0 130px"}}><div style={{...S.label,marginBottom:4}}>Desde</div>
+                <input type="date" style={{...S.input,padding:"6px 8px",fontSize:12}} value={filters.from} onChange={setFil("from")}/>
+              </div>
+              <div style={{flex:"0 0 130px"}}><div style={{...S.label,marginBottom:4}}>Hasta</div>
+                <input type="date" style={{...S.input,padding:"6px 8px",fontSize:12}} value={filters.to} onChange={setFil("to")}/>
+              </div>
+              {anyFilter&&<button onClick={clearFilters} style={{...S.btn("ghost"),padding:"7px 10px",fontSize:11}}><XCircle size={12}/>Limpiar</button>}
+            </div>
+            <div style={{fontSize:11,color:"#475569",marginTop:8}}>{filtered.length} de {incidents.length} novedades</div>
           </div>
           <div style={{display:"flex",flexDirection:"column",gap:8}}>
             {filtered.map(inc=>(
@@ -676,7 +756,7 @@ function IncidentForm({ incidents, setIncidents, onViewReport, logAudit }) {
                   <div style={{flex:1,minWidth:0}}>
                     {inc.reportName&&<div style={{fontSize:13,color:COLORS.primary,fontWeight:600,marginBottom:3}}>{inc.reportName}</div>}
                     <div style={{display:"flex",alignItems:"center",gap:7,marginBottom:5,flexWrap:"wrap"}}>
-                      <span style={{fontSize:11,fontFamily:"'JetBrains Mono',monospace",color:"#64748b"}}>{inc.time}</span>
+                      <span style={{fontSize:11,fontFamily:"'JetBrains Mono',monospace",color:"#64748b"}}>{inc.date?`${inc.date} · `:""}{inc.time}</span>
                       <span style={S.badge(COLORS.info)}>{inc.area}</span>
                       <span style={S.badge(STATUS_COLOR[inc.status])}>{inc.status}</span>
                       <span style={S.badge(SEVCOLORS[inc.severity]||"#64748b")}>{inc.severity}</span>
@@ -704,6 +784,25 @@ function IncidentForm({ incidents, setIncidents, onViewReport, logAudit }) {
 
 // ─── MRZ PARSER (Tesseract) ─────────────────────────────────────────────────────
 function parseMRZ(text) {
+  // Parser robusto primero (documentos alfanuméricos, O/0, nombres desde MRZ)
+  const robust = parseMRZRobust(text);
+  if (robust && robust.documentNumber && robust.dateOfBirth) {
+    return {
+      documentType: "Pasaporte",
+      firstName: robust.firstName || "",
+      lastName: robust.lastName || "",
+      fullName: robust.fullName || (robust.firstName ? (robust.firstName + " " + (robust.lastName||"")).trim() : ""),
+      documentNumber: robust.documentNumber,
+      nationality: robust.nationality || "",
+      dateOfBirth: robust.dateOfBirth,
+      gender: robust.gender || "",
+      expiryDate: robust.expiryDate || "",
+      issuingCountry: robust.issuingCountry || "",
+      mrz: "",
+      confidence: "alta",
+      notes: "Datos extraídos del MRZ (OCR)",
+    };
+  }
   const origText = text;
   const upperText = text.toUpperCase().replace(/\s+/g,"").replace(/</g,"");
   
@@ -830,7 +929,16 @@ function extractFromText(text, docType) {
   const r={firstName:"",lastName:"",fullName:"",documentNumber:"",dateOfBirth:"",nationality:"",gender:"",expiryDate:"",issuingCountry:"",documentType:docType||"Pasaporte",mrz:"",confidence:"baja",notes:"Extracción por OCR — revise los datos"};
   
   const lines = origText.split(/[\n\r]+/).map(l => l.trim()).filter(l => l.length > 0);
-  
+
+  // ── Parser MRZ robusto (cubre documentos alfanuméricos, O/0, nombres) ──────
+  const mrzData = parseMRZRobust(origText);
+  if (mrzData) {
+    for (const k of ["documentNumber","nationality","issuingCountry","dateOfBirth","gender","expiryDate","firstName","lastName","fullName"]) {
+      if (mrzData[k]) r[k] = mrzData[k];
+    }
+    if (r.documentNumber && r.dateOfBirth) { r.confidence = "alta"; r.notes = "Datos extraídos del MRZ (OCR)"; }
+  }
+
   // Buscar MRZ línea (formato típico: NnnnnnnnACCyymmddXNnnnnn)
   const mrzPattern = /[A-Z][0-9]{8}[A-Z]{3}[0-9]{7}[A-Z][0-9]{7}/;
   const mrzMatch = origText.match(mrzPattern);
@@ -903,8 +1011,8 @@ function extractFromText(text, docType) {
     }
   }
   
-  // Buscar nombres (líneas que parecen nombres, sin números ni códigos de país)
-  for(const line of lines){
+  // Buscar nombres (líneas que parecen nombres) — solo si el MRZ no los dio
+  if(!r.fullName) for(const line of lines){
     const clean = line.replace(/[^A-ZÁÉÍÓÚÑ\s]/g,"").trim();
     const words = clean.split(/\s+/).filter(w => w.length >= 2);
     if(words.length >= 2 && clean.length < 45 && clean.length > 4){
@@ -929,18 +1037,7 @@ function extractFromText(text, docType) {
 }
 
  // ─── FULL OCR SCANNER PAGE ────────────────────────────────────────────────────
-function matchWatchlist(result, watchlist) {
-  if (!result || !watchlist || !watchlist.length) return [];
-  const norm = s => (s||"").toString().toUpperCase().replace(/\s+/g,"");
-  const doc = norm(result.documentNumber);
-  const name = (result.fullName || ((result.firstName||"")+" "+(result.lastName||""))).toLowerCase().trim();
-  return watchlist.filter(w => {
-    const docHit = w.docNumber && doc && norm(w.docNumber) === doc;
-    const wn = (w.name||"").toLowerCase().trim();
-    const nameHit = wn && name && name.includes(wn);
-    return docHit || nameHit;
-  });
-}
+// matchWatchlist ahora vive en ./lib/watchlist.js (importado arriba)
 
 function OCRScanner({ watchlist }) {
   const [img, setImg] = useState(null);
@@ -1085,11 +1182,11 @@ faceX,faceY,faceW,faceH son NÚMEROS 0-100 indicando posición porcentual del RO
       <div style={{...S.flex,marginBottom:4,justifyContent:"space-between",alignItems:"flex-start"}}>
         <div>
           <div style={S.h1}>Scanner de Documentos</div>
-          <div style={{...S.mono,marginTop:2}}>{mode==="claude"?"Claude Vision API · Alta precisión, requiere conexión":mode==="lm:qwen2.5-vl-7b-instruct"?"Qwen (LM Studio) · Local con visión":"OCR.space · En línea, preciso"}</div>
+          <div style={{...S.mono,marginTop:2}}>{mode==="claude"?"IA con visión · Proveedor configurado en Ajustes":mode==="lm:qwen2.5-vl-7b-instruct"?"Qwen (LM Studio) · Local con visión":"OCR.space · En línea, preciso"}</div>
         </div>
         {/* Toggle de modo */}
         <div style={{display:"flex",background:"#0b1020",border:"1px solid #1e2d4a",borderRadius:9,padding:3,gap:3,flexShrink:0}}>
-          {[["claude","🤖 IA (Claude)"],["lm:qwen2.5-vl-7b-instruct","🐋 Qwen (LM)"],["ocrspace","☁ OCR.space"]].map(([m,label])=>(
+          {[["claude","🤖 IA"],["lm:qwen2.5-vl-7b-instruct","🐋 Qwen (LM)"],["ocrspace","☁ OCR.space"]].map(([m,label])=>(
             <button key={m} onClick={()=>{setMode(m);setResult(null);setError("");}} style={{padding:"6px 14px",borderRadius:7,cursor:"pointer",border:"none",background:mode===m?"#1a2a45":"transparent",color:mode===m?COLORS.primary:"#64748b",fontSize:12,fontWeight:mode===m?500:400,transition:"all 0.15s"}}>
               {label}
             </button>
@@ -1100,7 +1197,7 @@ faceX,faceY,faceW,faceH son NÚMEROS 0-100 indicando posición porcentual del RO
       {/* Info banner por modo */}
       <div style={{...S.card,padding:"10px 16px",marginBottom:16,display:"flex",alignItems:"center",gap:10,background:mode==="claude"?"#6366f108":mode==="lm:qwen2.5-vl-7b-instruct"?"#10b98108":"#6366f108",border:"1px solid "+(mode==="claude"?"#6366f120":mode==="lm:qwen2.5-vl-7b-instruct"?"#10b98120":"#6366f120")}}>
         {mode==="claude"
-          ? <><span style={{fontSize:13}}>🤖</span><span style={{fontSize:11,color:"#94a3b8"}}>Claude Vision extrae datos con alta precisión. Requiere API key y conexión a internet.</span></>
+          ? <><span style={{fontSize:13}}>🤖</span><span style={{fontSize:11,color:"#94a3b8"}}>La IA seleccionada en Ajustes extrae los datos. Requiere proveedor configurado (clave + modelo con visión).</span></>
           : mode==="lm:qwen2.5-vl-7b-instruct"
           ? <><span style={{fontSize:13}}>🐋</span><span style={{fontSize:11,color:"#94a3b8"}}>Qwen via LM Studio. Requiere modelo de visión cargado en LM Studio (puerto 1234).</span></>
           : <><span style={{fontSize:13}}>☁</span><span style={{fontSize:11,color:"#94a3b8"}}>OCR.space procesa en la nube. 5000 scans/mes gratis. Precisión alta en español.</span></>
@@ -1139,7 +1236,7 @@ faceX,faceY,faceW,faceH son NÚMEROS 0-100 indicando posición porcentual del RO
             )}
 
             <button onClick={analyze} disabled={!img||loading} style={{...S.btn(),width:"100%",marginTop:11,justifyContent:"center",opacity:(!img||loading)?0.5:1}}>
-              <Camera size={14} color="#000"/>{loading?(mode==="claude"?"Procesando con IA...":"Procesando con OCR..."):(mode==="claude"?"Analizar con Claude Vision":"Analizar con OCR")}
+              <Camera size={14} color="#000"/>{loading?(mode==="claude"?"Procesando con IA...":"Procesando con OCR..."):(mode==="claude"?"Analizar con IA":"Analizar con OCR")}
             </button>
             {error&&<div style={{marginTop:10,background:"#ef444415",border:"1px solid #ef444430",borderRadius:7,padding:"7px 11px",fontSize:11,color:"#ef4444"}}>{error}</div>}
           </div>
@@ -1612,7 +1709,7 @@ h2{font-size:12px;font-weight:800;color:#1a2744;border-bottom:2px solid #c8a94a;
 
 
 // ─── SETTINGS PANEL ───────────────────────────────────────────────────────────
-function SettingsPanel({ user, users, setUsers, setUser, watchlist, setWatchlist, onDataRestored, audit = [], logAudit }) {
+function SettingsPanel({ user, users, setUsers, setUser, watchlist, setWatchlist, onDataRestored, audit = [], logAudit, aiConfig, setAiConfig }) {
   const isAdmin = user.role === "admin";
   const [tab, setTab] = useState("password"); // "password" | "users" | "ai" | "backup" | "watchlist" | "audit"
   // ── Respaldo / restauración ────────────────────────────────────────────────
@@ -1662,19 +1759,23 @@ function SettingsPanel({ user, users, setUsers, setUser, watchlist, setWatchlist
     setWatchlist(prev => (prev||[]).filter(w => w.id !== id));
     logAudit && logAudit("eliminar","vigilancia", w ? (w.docNumber||w.name) : ("#"+id));
   };
-  // ── API Key de IA (Anthropic) ──────────────────────────────────────────────
-  const [apiKeyInput, setApiKeyInput] = useState(() => { try { return localStorage.getItem("aeroreport_anthropic_key") || ""; } catch(e) { return ""; } });
+  // ── Configuración de IA multi-proveedor ────────────────────────────────────
   const [showKey, setShowKey] = useState(false);
   const [keyMsg, setKeyMsg] = useState(null);
-  const saveKey = () => {
-    const v = apiKeyInput.trim();
-    if (v && !v.startsWith("sk-ant-")) return setKeyMsg({type:"err",text:"La clave de Anthropic debe empezar con 'sk-ant-'."});
-    try { localStorage.setItem("aeroreport_anthropic_key", v); setKeyMsg({type:"ok",text:"Clave guardada en este dispositivo."}); }
-    catch(e) { setKeyMsg({type:"err",text:"No se pudo guardar la clave."}); }
+  const aic = normalizeAIConfig(aiConfig);
+  const prov = aic.provider;
+  const provSettings = aic.settings[prov];
+  const needsBaseUrl = (prov === "compatible" || prov === "ollama" || prov === "openrouter");
+  const needsKey = (prov !== "ollama");
+  const setProvider = (p) => { setKeyMsg(null); setAiConfig({ ...aic, provider: p }); };
+  const setProvField = (field) => (e) => {
+    const v = e.target.value;
+    setAiConfig({ ...aic, settings: { ...aic.settings, [prov]: { ...aic.settings[prov], [field]: v } } });
   };
+  const saveKey = () => setKeyMsg({ type:"ok", text:"Configuración guardada." }); // el guardado real es automático vía store
   const clearKey = () => {
-    try { localStorage.removeItem("aeroreport_anthropic_key"); setApiKeyInput(""); setKeyMsg({type:"ok",text:"Clave eliminada de este dispositivo."}); }
-    catch(e) {}
+    setAiConfig({ ...aic, settings: { ...aic.settings, [prov]: { ...aic.settings[prov], apiKey:"" } } });
+    setKeyMsg({ type:"ok", text:"Clave eliminada." });
   };
   // ── Change Password ────────────────────────────────────────────────────────
   const [pwForm, setPwForm] = useState({ current:"", next:"", confirm:"" });
@@ -1775,48 +1876,67 @@ function SettingsPanel({ user, users, setUsers, setUser, watchlist, setWatchlist
       {/* ── TAB: IA / API KEY ─────────────────────────────────────────────── */}
       {tab==="ai"&&(
         <div style={{...S.row,alignItems:"flex-start"}}>
-          <div style={{flex:"0 0 460px"}}>
+          <div style={{flex:"0 0 480px"}}>
             <div style={S.card}>
-              <div style={{...S.h2,marginBottom:4}}>Clave de API de Anthropic (Claude)</div>
-              <div style={{fontSize:12,color:"#64748b",marginBottom:16}}>
-                Necesaria para el análisis con Claude. Se guarda solo en este dispositivo y nunca se incluye en el instalador.
+              <div style={{...S.h2,marginBottom:4}}>Proveedor de IA</div>
+              <div style={{fontSize:12,color:"#64748b",marginBottom:14}}>
+                Elige el proveedor para el análisis del scanner. La configuración se guarda cifrada en este equipo.
+              </div>
+              <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:16}}>
+                {AI_PROVIDERS.map(p=>(
+                  <button key={p} onClick={()=>setProvider(p)} style={{padding:"7px 12px",borderRadius:7,cursor:"pointer",border:"1px solid "+(prov===p?"#f59e0b":"#1e2d4a"),background:prov===p?"#1a2a45":"transparent",color:prov===p?COLORS.primary:"#94a3b8",fontSize:12,fontWeight:prov===p?600:400}}>
+                    {AI_PROVIDER_LABELS[p]}
+                  </button>
+                ))}
               </div>
               <div style={{display:"flex",flexDirection:"column",gap:12}}>
-                <div>
-                  <div style={{...S.label,marginBottom:5}}>API Key</div>
-                  <div style={{display:"flex",gap:8}}>
-                    <input style={{...S.input,flex:1,fontFamily:"'JetBrains Mono',monospace"}} type={showKey?"text":"password"} placeholder="sk-ant-..." value={apiKeyInput} onChange={e=>setApiKeyInput(e.target.value)} onKeyDown={e=>e.key==="Enter"&&saveKey()}/>
-                    <button onClick={()=>setShowKey(s=>!s)} title={showKey?"Ocultar":"Mostrar"} style={{...S.btn("ghost"),padding:"0 12px"}}>
-                      {showKey?<EyeOff size={14}/>:<Eye size={14}/>}
-                    </button>
+                {needsKey&&(
+                  <div>
+                    <div style={{...S.label,marginBottom:5}}>API Key</div>
+                    <div style={{display:"flex",gap:8}}>
+                      <input style={{...S.input,flex:1,fontFamily:"'JetBrains Mono',monospace"}} type={showKey?"text":"password"} placeholder="Pega tu clave" value={provSettings.apiKey||""} onChange={setProvField("apiKey")}/>
+                      <button onClick={()=>setShowKey(s=>!s)} title={showKey?"Ocultar":"Mostrar"} style={{...S.btn("ghost"),padding:"0 12px"}}>
+                        {showKey?<EyeOff size={14}/>:<Eye size={14}/>}
+                      </button>
+                    </div>
                   </div>
+                )}
+                <div>
+                  <div style={{...S.label,marginBottom:5}}>Modelo</div>
+                  <input style={{...S.input,fontFamily:"'JetBrains Mono',monospace"}} placeholder="Nombre del modelo" value={provSettings.model||""} onChange={setProvField("model")}/>
                 </div>
+                {needsBaseUrl&&(
+                  <div>
+                    <div style={{...S.label,marginBottom:5}}>URL base {prov==="openrouter"?"(opcional)":""}</div>
+                    <input style={{...S.input,fontFamily:"'JetBrains Mono',monospace"}} placeholder={prov==="ollama"?"http://localhost:11434/v1":"https://.../v1"} value={provSettings.baseUrl||""} onChange={setProvField("baseUrl")}/>
+                  </div>
+                )}
                 {keyMsg&&<div style={{background:keyMsg.type==="ok"?COLORS.success+"18":"#ef444415",border:"1px solid "+(keyMsg.type==="ok"?COLORS.success+"40":"#ef444430"),borderRadius:8,padding:"8px 12px",fontSize:12,color:keyMsg.type==="ok"?COLORS.success:"#ef4444"}}>{keyMsg.text}</div>}
                 <div style={{display:"flex",gap:8}}>
-                  <button onClick={saveKey} style={{...S.btn(),justifyContent:"center",flex:1}}>
-                    <KeyRound size={14}/>Guardar Clave
-                  </button>
-                  <button onClick={clearKey} style={{...S.btn("danger"),padding:"0 16px"}}>
-                    <Trash2 size={14}/>Quitar
-                  </button>
+                  <button onClick={saveKey} style={{...S.btn(),justifyContent:"center",flex:1}}><CheckCircle size={14}/>Listo</button>
+                  {needsKey&&<button onClick={clearKey} style={{...S.btn("danger"),padding:"0 16px"}}><Trash2 size={14}/>Quitar clave</button>}
                 </div>
                 <div style={{fontSize:11,color:"#64748b",lineHeight:1.6}}>
-                  Estado actual: {getStoredApiKey() ? <span style={{color:COLORS.success}}>● Clave configurada</span> : <span style={{color:COLORS.warning}}>○ Sin clave (Claude no estará disponible)</span>}
+                  Estado: {(!needsKey || (provSettings.apiKey||"").trim())
+                    ? <span style={{color:COLORS.success}}>● {AI_PROVIDER_LABELS[prov]} configurado</span>
+                    : <span style={{color:COLORS.warning}}>○ Falta la clave de {AI_PROVIDER_LABELS[prov]}</span>}
                 </div>
               </div>
             </div>
           </div>
           <div style={{flex:1}}>
             <div style={S.card}>
-              <div style={{...S.h2,marginBottom:14}}>Cómo obtener la clave</div>
-              {[["1","Entra a console.anthropic.com e inicia sesión"],["2","Ve a Settings → API Keys"],["3","Crea una nueva clave (Create Key)"],["4","Cópiala y pégala aquí. Empieza con 'sk-ant-'"]].map(([n,t],i)=>(
-                <div key={i} style={{display:"flex",alignItems:"center",gap:10,padding:"7px 0",borderBottom:"1px solid #1a2540"}}>
-                  <span style={{color:COLORS.primary,fontWeight:700,fontSize:13,width:16}}>{n}</span>
-                  <span style={{fontSize:12,color:"#94a3b8"}}>{t}</span>
-                </div>
-              ))}
-              <div style={{fontSize:11,color:"#64748b",marginTop:12,lineHeight:1.6}}>
-                Alternativas sin clave: OCR.space (en la nube) y Tesseract (local) funcionan sin configurar nada. LM Studio (Qwen) requiere la app abierta en el puerto 1234.
+              <div style={{...S.h2,marginBottom:14}}>Ayuda — {AI_PROVIDER_LABELS[prov]}</div>
+              <div style={{fontSize:12,color:"#94a3b8",lineHeight:1.7}}>
+                {prov==="anthropic"&&<>Clave en <b>console.anthropic.com</b> → API Keys. Empieza con <code>sk-ant-</code>. Modelo sugerido: <code>claude-sonnet-4-6</code>.</>}
+                {prov==="openai"&&<>Clave en <b>platform.openai.com</b> → API keys. Empieza con <code>sk-</code>. Modelo con visión: <code>gpt-4o</code> o <code>gpt-4o-mini</code>.</>}
+                {prov==="gemini"&&<>Clave en <b>aistudio.google.com/apikey</b>. Empieza con <code>AIza</code>. Modelo: <code>gemini-1.5-flash</code> o <code>gemini-1.5-pro</code>.</>}
+                {prov==="openrouter"&&<>Clave en <b>openrouter.ai/keys</b>. Un solo key, muchos modelos. Ej.: <code>openai/gpt-4o</code>, <code>anthropic/claude-3.5-sonnet</code>, <code>google/gemini-flash-1.5</code>.</>}
+                {prov==="compatible"&&<>Cualquier servidor compatible con OpenAI. Indica <b>URL base</b> (terminada en <code>/v1</code>), tu clave y el modelo. Cubre Groq, vLLM, etc.</>}
+                {prov==="ollama"&&<>Local, sin clave. Instala Ollama y descarga un modelo con visión (<code>ollama pull llama3.2-vision</code>). URL base por defecto: <code>http://localhost:11434/v1</code>.</>}
+              </div>
+              <div style={{fontSize:11,color:"#64748b",marginTop:14,lineHeight:1.6,borderTop:"1px solid #1a2540",paddingTop:12}}>
+                Todos requieren un modelo con <b>visión</b> (el scanner lee imágenes). Sin IA, OCR.space y Tesseract siguen funcionando sin configurar nada.
               </div>
             </div>
           </div>
@@ -2104,10 +2224,84 @@ function SettingsPanel({ user, users, setUsers, setUser, watchlist, setWatchlist
   );
 }
 
+// ─── FICHAS DE PERSONAS (agrega personas ↔ novedades) ─────────────────────────
+function PersonDossier({ incidents, onViewReport }) {
+  const [q, setQ] = useState("");
+  const [expanded, setExpanded] = useState(null);
+  const map = {};
+  (incidents||[]).forEach(inc => {
+    const ppl = (inc.persons && inc.persons.length) ? inc.persons : (inc.person ? [inc.person] : []);
+    ppl.forEach(p => {
+      const name = (p.fullName || ((p.firstName||"")+" "+(p.lastName||""))).trim();
+      const doc = (p.documentNumber||"").toString().toUpperCase().replace(/\s+/g,"");
+      const key = doc || name.toLowerCase();
+      if (!key) return;
+      if (!map[key]) map[key] = { key, name, doc:p.documentNumber||"", nationality:p.nationality||"", photo:p.personPhoto||"", incidents:[] };
+      if (!map[key].name && name) map[key].name = name;
+      if (!map[key].photo && p.personPhoto) map[key].photo = p.personPhoto;
+      if (!map[key].nationality && p.nationality) map[key].nationality = p.nationality;
+      map[key].incidents.push(inc);
+    });
+  });
+  let people = Object.values(map).sort((a,b)=>b.incidents.length-a.incidents.length);
+  const qq = q.toLowerCase().trim();
+  if (qq) people = people.filter(p => p.name.toLowerCase().includes(qq) || (p.doc||"").toLowerCase().includes(qq));
+  return (
+    <div className="fade-in">
+      <div style={{...S.flex,marginBottom:6,justifyContent:"space-between"}}>
+        <div style={S.h1}>Fichas de Personas</div>
+        <div style={S.badge(COLORS.info)}><Users size={11}/>{people.length} persona(s)</div>
+      </div>
+      <div style={{...S.mono,marginBottom:16}}>Personas detectadas en novedades, agrupadas por documento o nombre</div>
+      <div style={{position:"relative",marginBottom:14,maxWidth:420}}>
+        <input style={{...S.input,paddingLeft:32}} placeholder="Buscar por nombre o documento..." value={q} onChange={e=>setQ(e.target.value)}/>
+        <Search size={13} color="#475569" style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)"}}/>
+      </div>
+      {people.length===0 && <div style={{...S.card,textAlign:"center",color:"#475569",padding:32}}>No hay personas registradas en las novedades.</div>}
+      <div style={{display:"flex",flexDirection:"column",gap:8}}>
+        {people.map(p=>(
+          <div key={p.key} style={{...S.card,padding:"12px 16px"}}>
+            <div style={{display:"flex",alignItems:"center",gap:12,cursor:"pointer"}} onClick={()=>setExpanded(expanded===p.key?null:p.key)}>
+              {p.photo
+                ? <img src={p.photo} style={{width:42,height:52,objectFit:"cover",borderRadius:6,border:"1px solid #1e2d4a",flexShrink:0}} alt="foto"/>
+                : <div style={{width:42,height:52,background:"#1a2a45",borderRadius:6,border:"1px solid #1e2d4a",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}><User size={18} color="#475569"/></div>}
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontSize:14,color:"#e2e8f0",fontWeight:600}}>{p.name||"(sin nombre)"}</div>
+                <div style={{fontSize:11,color:"#475569",marginTop:2,display:"flex",gap:10,flexWrap:"wrap"}}>
+                  {p.doc&&<span style={{fontFamily:"'JetBrains Mono',monospace",color:COLORS.primary}}>{p.doc}</span>}
+                  {p.nationality&&<span>{p.nationality}</span>}
+                </div>
+              </div>
+              <div style={S.badge(COLORS.warning)}>{p.incidents.length} novedad{p.incidents.length!==1?"es":""}</div>
+              <ChevronRight size={14} style={{transform:expanded===p.key?"rotate(90deg)":"none",transition:"transform 0.15s",color:"#475569"}}/>
+            </div>
+            {expanded===p.key&&(
+              <div style={{marginTop:12,paddingTop:12,borderTop:"1px solid #1a2540",display:"flex",flexDirection:"column",gap:6}}>
+                {p.incidents.map(inc=>(
+                  <div key={inc.id} style={{display:"flex",alignItems:"center",gap:10,padding:"7px 10px",background:"#0b1020",borderRadius:7}}>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{fontSize:12,color:inc.reportName?COLORS.primary:"#94a3b8",fontWeight:inc.reportName?600:400}}>{inc.reportName||(inc.area+" — "+inc.time)}</div>
+                      <div style={{fontSize:10,color:"#475569",marginTop:2}}>{inc.date?inc.date+" · ":""}{inc.time} · {inc.area}</div>
+                    </div>
+                    <span style={S.badge(STATUS_COLOR[inc.status])}>{inc.status}</span>
+                    <span style={S.badge(SEVCOLORS[inc.severity]||"#64748b")}>{inc.severity}</span>
+                    <button onClick={()=>onViewReport(inc)} style={{...S.btn("ghost"),padding:"4px 8px"}} title="Ver informe"><Printer size={12}/></button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // ─── NAV ──────────────────────────────────────────────────────────────────────
 const NAV = [
   { id:"dashboard",  label:"Dashboard",    icon:<BarChart2 size={15}/> },
   { id:"incidents",  label:"Novedades",    icon:<AlertTriangle size={15}/> },
+  { id:"persons",    label:"Fichas",       icon:<User size={15}/> },
   { id:"networkMap", label:"Mapa Personas",icon:<Network size={15}/> },
   { id:"scanner",    label:"Scanner Doc.", icon:<Camera size={15}/> },
   { id:"reports",    label:"Informes",     icon:<FileText size={15}/> },
@@ -2132,25 +2326,7 @@ function saveToStorage(key, value) {
   try { localStorage.setItem(key, JSON.stringify(value)); } catch(e) {}
 }
 
-// ─── HASH DE CONTRASEÑAS (Web Crypto · PBKDF2-SHA256) ─────────────────────────
-// Funciona igual en el renderer de Electron y en web. Nunca se guarda texto plano.
-const _toHex = a => Array.from(new Uint8Array(a)).map(x=>x.toString(16).padStart(2,"0")).join("");
-async function hashPassword(password, saltHex) {
-  const enc = new TextEncoder();
-  const salt = saltHex
-    ? Uint8Array.from(saltHex.match(/.{2}/g).map(b=>parseInt(b,16)))
-    : crypto.getRandomValues(new Uint8Array(16));
-  const km = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]);
-  const bits = await crypto.subtle.deriveBits({ name:"PBKDF2", salt, iterations:120000, hash:"SHA-256" }, km, 256);
-  return `pbkdf2$120000$${_toHex(salt)}$${_toHex(bits)}`;
-}
-async function verifyPassword(password, stored) {
-  if (!stored || typeof stored !== "string") return false;
-  const parts = stored.split("$");
-  if (parts.length !== 4) return false;
-  const recomputed = await hashPassword(password, parts[2]);
-  return recomputed === stored;
-}
+// hashPassword y verifyPassword ahora viven en ./lib/security.js (importados arriba)
 
 // ─── PERSISTENCIA (store cifrado en Electron · localStorage como fallback web) ──
 const LS_KEYS = {
@@ -2196,6 +2372,11 @@ async function collectFromLocalStorage() {
   const counter   = loadFromStorage(LS_KEYS.counter, null);
   const watchlist = loadFromStorage(LS_KEYS.watchlist, null);
   const savedMaps = loadFromStorage(LS_KEYS.savedMaps, null);
+  // Migra la clave vieja de Anthropic (si existía en localStorage) a la nueva config
+  let oldKey = "";
+  try { oldKey = (localStorage.getItem("aeroreport_anthropic_key") || "").trim(); } catch(e) {}
+  const aiconfig = normalizeAIConfig(null);
+  if (oldKey) aiconfig.settings.anthropic.apiKey = oldKey;
   return {
     incidents: incidents || SAMPLE_INCIDENTS,
     users: usersRaw ? await normalizeUsers(usersRaw) : await seedDefaultUsers(),
@@ -2204,6 +2385,7 @@ async function collectFromLocalStorage() {
     watchlist: watchlist || [],
     savedMaps: savedMaps || [],
     audit: [],
+    aiconfig,
   };
 }
 
@@ -2215,6 +2397,7 @@ function clearSensitiveLocalStorage() {
     localStorage.removeItem(LS_KEYS.counter);
     localStorage.removeItem(LS_KEYS.watchlist);
     localStorage.removeItem(LS_KEYS.savedMaps);
+    localStorage.removeItem("aeroreport_anthropic_key");
   } catch(e) {}
 }
 
@@ -2234,6 +2417,7 @@ async function bootstrapData() {
         await persistSave("watchlist", migrated.watchlist);
         await persistSave("savedMaps", migrated.savedMaps);
         await persistSave("audit", migrated.audit);
+        await persistSave("aiconfig", migrated.aiconfig);
         clearSensitiveLocalStorage();
         return migrated;
       }
@@ -2246,6 +2430,7 @@ async function bootstrapData() {
         watchlist: data.watchlist || [],
         savedMaps: data.savedMaps || [],
         audit: data.audit || [],
+        aiconfig: normalizeAIConfig(data.aiconfig),
       };
     }
   }
@@ -2263,6 +2448,7 @@ export default function App() {
   const [watchlist, setWatchlist] = useState([]);
   const [savedMaps, setSavedMaps] = useState([]);
   const [audit, setAudit] = useState([]);
+  const [aiConfig, setAiConfig] = useState(DEFAULT_AI);
   const [dataLoaded, setDataLoaded] = useState(false);
   const [theme, setTheme] = useState('dark');
   const [pwaInstallable, setPwaInstallable] = useState(false);
@@ -2282,6 +2468,8 @@ export default function App() {
       setWatchlist(d.watchlist);
       setSavedMaps(d.savedMaps || []);
       setAudit(d.audit || []);
+      setAiConfig(normalizeAIConfig(d.aiconfig));
+      setModuleAI(normalizeAIConfig(d.aiconfig));
       setDataLoaded(true);
     })();
     return () => { alive = false; };
@@ -2332,6 +2520,13 @@ export default function App() {
     persistSave("audit", audit);
   }, [audit, dataLoaded]);
 
+  // ─── Config de IA: guardar y actualizar el espejo de módulo ───────────────
+  useEffect(() => {
+    setModuleAI(aiConfig);
+    if (!dataLoaded) return;
+    persistSave("aiconfig", aiConfig);
+  }, [aiConfig, dataLoaded]);
+
   // Registra una acción en el log de auditoría (append-only, tope 3000)
   const logAudit = useCallback((action, entity, summary) => {
     setAudit(prev => [{
@@ -2379,15 +2574,17 @@ export default function App() {
     setReportCounter(d.counter||0);
     setWatchlist(d.watchlist||[]);
     setSavedMaps(d.savedMaps||[]);
+    if (d.aiconfig) setAiConfig(normalizeAIConfig(d.aiconfig));
   };
 
   const pages = {
     dashboard: <Dashboard incidents={incidents}/>,
     incidents:  <IncidentForm incidents={incidents} setIncidents={setIncidents} onViewReport={handleViewReport} logAudit={logAudit}/>,
+    persons:    <PersonDossier incidents={incidents} onViewReport={handleViewReport}/>,
     networkMap: <Suspense fallback={<div style={{padding:40,color:"#64748b",fontSize:13}}>Cargando mapa…</div>}><NetworkMap persons={persons} setPersons={setPersons} incidents={incidents} theme={theme} setTheme={setTheme} savedMaps={savedMaps} setSavedMaps={setSavedMaps}/></Suspense>,
     scanner:    <OCRScanner watchlist={watchlist}/>,
     reports:    <ReportGenerator incidents={incidents} user={user} reportCounter={reportCounter} setReportCounter={setReportCounter} onPrintInc={printRef}/>,
-    settings:   <SettingsPanel user={user} users={users} setUsers={setUsers} setUser={setUser} watchlist={watchlist} setWatchlist={setWatchlist} onDataRestored={handleDataRestored} audit={audit} logAudit={logAudit}/>,
+    settings:   <SettingsPanel user={user} users={users} setUsers={setUsers} setUser={setUser} watchlist={watchlist} setWatchlist={setWatchlist} onDataRestored={handleDataRestored} audit={audit} logAudit={logAudit} aiConfig={aiConfig} setAiConfig={setAiConfig}/>,
   };
 
   return (

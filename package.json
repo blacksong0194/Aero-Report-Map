@@ -1,6 +1,6 @@
 {
   "name": "aero-report-map",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "AeroReport Pro - Sistema de novedades aeroportuarias",
   "main": "electron/main.js",
   "author": "AeroReport Pro",
@@ -12,7 +12,8 @@
     "build:win": "npm run build && electron-builder --win --x64",
     "build:linux": "npm run build && electron-builder --linux --x64",
     "release": "npm run build && electron-builder --win --x64 --publish always",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "vitest run"
   },
   "dependencies": {
     "react": "^18.3.1",
@@ -32,6 +33,7 @@
     "electron": "^31.3.1",
     "electron-builder": "^24.13.3",
     "vite": "^5.4.2",
+    "vitest": "^2.1.9",
     "wait-on": "^7.2.0"
   },
   "build": {

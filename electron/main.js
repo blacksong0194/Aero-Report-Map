@@ -5,6 +5,7 @@ const http = require('http')
 const fs = require('fs')
 const store = require('./store')
 const { autoUpdater } = require('electron-updater')
+const { callAI } = require('./ai-providers')
 
 const isDev = process.env.ELECTRON === 'true'
 
@@ -268,6 +269,19 @@ ipcMain.handle('lm-studio-request', async (_, { model, messages, max_tokens }) =
 ipcMain.handle('show-open-dialog', async (_, opts) => dialog.showOpenDialog(mainWindow, opts))
 ipcMain.handle('get-version', () => app.getVersion())
 ipcMain.handle('get-platform', () => process.platform)
+
+// ── IA multi-proveedor (Anthropic / OpenAI / Gemini / OpenRouter / compatible / Ollama)
+ipcMain.handle('ai-request', async (_, { config, messages, max_tokens }) => {
+  safeLog(`[${new Date().toISOString()}] ai-request: provider=${config && config.provider}, model=${config && config.model}\n`)
+  try {
+    const res = await callAI(config || {}, { messages, max_tokens })
+    safeLog(`[${new Date().toISOString()}] ai-request response: ok=${res.ok}, status=${res.status}\n`)
+    return res
+  } catch (e) {
+    safeLog(`[${new Date().toISOString()}] ai-request error: ${e.message}\n`)
+    return { ok: false, status: 0, data: { error: { message: e.message } } }
+  }
+})
 
 // ── Exportar HTML a PDF (printToPDF, alta calidad vectorial) ─────────────────
 ipcMain.handle('export-pdf', async (_, { html, defaultName }) => {

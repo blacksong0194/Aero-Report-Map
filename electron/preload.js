@@ -15,6 +15,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   storeBackup: (passphrase) => ipcRenderer.invoke('store-backup', { passphrase }),
   storeRestore: (passphrase) => ipcRenderer.invoke('store-restore', { passphrase }),
   exportPDF: (html, defaultName) => ipcRenderer.invoke('export-pdf', { html, defaultName }),
+  aiRequest: (payload) => ipcRenderer.invoke('ai-request', payload),
   isElectron: true,
   platform: process.platform
 })
