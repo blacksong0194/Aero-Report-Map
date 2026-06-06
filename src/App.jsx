@@ -8,13 +8,12 @@ import { hashPassword, verifyPassword } from "./lib/security.js";
 import { buildReportNumber, todayStr } from "./lib/format.js";
 import { matchWatchlist } from "./lib/watchlist.js";
 import { parseMRZRobust, documentExpiryStatus } from "./lib/mrz.js";
-import { findDuplicates } from "./lib/person-match.js";
+import { findDuplicates, normalizeDoc, docsLikelySame } from "./lib/person-match.js";
 import { buildNotifications } from "./lib/notifications.js";
 import { matchReportedDoc, REPORTED_TYPES } from "./lib/reported-docs.js";
 import { parseReportedRows } from "./lib/import-reported.js";
 import * as XLSX from "xlsx";
-import { bestFaceMatches, matchConfidence } from "./lib/face-match.js";
-import { getFaceDescriptor } from "./face-service.js";
+import { verifyFace, getStatus as getBioStatus, refreshStatus as refreshBioStatus } from "./services/biometrics/biometricService.js";
 
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
 const COLORS = { primary: "#f59e0b", danger: "#ef4444", success: "#10b981", info: "#6366f1", warning: "#f97316" };
@@ -1197,7 +1196,7 @@ function extractFromText(text, docType) {
  // ─── FULL OCR SCANNER PAGE ────────────────────────────────────────────────────
 // matchWatchlist ahora vive en ./lib/watchlist.js (importado arriba)
 
-function OCRScanner({ watchlist, reportedDocs = [], knownFaces = [] }) {
+function OCRScanner({ watchlist, reportedDocs = [], knownFaces = [], incidents = [] }) {
   const [img, setImg] = useState(null);
   const [faceChecking, setFaceChecking] = useState(false);
   const [faceResult, setFaceResult] = useState(null); // {matches:[], error?}
@@ -1219,18 +1218,25 @@ function OCRScanner({ watchlist, reportedDocs = [], knownFaces = [] }) {
   const handleFaceCheck = async () => {
     if (!result || !result.personPhoto) return;
     setFaceChecking(true); setFaceResult(null);
-    try {
-      const scanned = await getFaceDescriptor(result.personPhoto);
-      if (!scanned) { setFaceResult({ error: "No se detectó un rostro en la foto escaneada." }); setFaceChecking(false); return; }
-      const candidates = [];
-      for (const kf of knownFaces) {
-        try { const d = await getFaceDescriptor(kf.photo); if (d) candidates.push({ ...kf, descriptor: d }); } catch (e) {}
-      }
-      setFaceResult({ matches: bestFaceMatches(scanned, candidates), checked: candidates.length });
-    } catch (e) {
-      setFaceResult({ error: "No se pudo verificar: " + e.message + ". ¿Copiaste los modelos con \"npm run setup:face\"?" });
-    }
+    const r = await verifyFace(result.personPhoto, knownFaces);
+    setFaceResult(r);
     setFaceChecking(false);
+  };
+
+  // Abre el informe de la persona coincidente (clic en la coincidencia facial)
+  const openMatchReport = (m) => {
+    const md = normalizeDoc(m.docNumber);
+    const mn = (m.name || "").toLowerCase().trim();
+    const inc = incidents.find((i) => {
+      const ppl = (i.persons && i.persons.length) ? i.persons : (i.person ? [i.person] : []);
+      return ppl.some((p) => {
+        const pd = normalizeDoc(p.documentNumber);
+        if (pd && md && pd === md) return true;
+        const pn = (p.fullName || ((p.firstName || "") + " " + (p.lastName || "")).trim()).toLowerCase();
+        return mn && pn && pn === mn;
+      });
+    });
+    if (inc) { const w = window.open("", "_blank", "width=820,height=900"); if (w) { w.document.write(buildIncidentWindowHTML(inc)); w.document.close(); } }
   };
 
   // ─── Modo Claude Vision API ──────────────────────────────────────────────
@@ -1505,21 +1511,27 @@ faceX,faceY,faceW,faceH son NÚMEROS 0-100 indicando posición porcentual del RO
                       <User size={13}/>{faceChecking?"Verificando…":"Verificar rostro"}
                     </button>
                   </div>
+                  {faceResult&&!faceResult.error&&<div style={{fontSize:10,color:"#475569",marginTop:6}}>Motor: {faceResult.backend==="insightface"?"InsightFace (servicio)":"face-api (local)"}</div>}
                   {faceResult&&faceResult.error&&<div style={{fontSize:11,color:"#ef4444",marginTop:8}}>{faceResult.error}</div>}
                   {faceResult&&!faceResult.error&&faceResult.matches.length===0&&<div style={{fontSize:11,color:COLORS.success,marginTop:8}}>● Sin coincidencias faciales ({faceResult.checked} comparados).</div>}
                   {faceResult&&!faceResult.error&&faceResult.matches.length>0&&(
                     <div style={{marginTop:8,display:"flex",flexDirection:"column",gap:6}}>
                       {faceResult.matches.map((m,i)=>{
-                        const sameDoc = m.docNumber && result.documentNumber && m.docNumber.toUpperCase().replace(/\s/g,"")===result.documentNumber.toUpperCase().replace(/\s/g,"");
-                        const impersonation = !sameDoc;
+                        const sameDoc = m.docNumber && result.documentNumber && docsLikelySame(m.docNumber, result.documentNumber);
+                        const watchHit = m.source==="vigilancia";
+                        const impersonation = !watchHit && m.docNumber && result.documentNumber && !sameDoc;
+                        const danger = watchHit || impersonation;
                         return (
-                          <div key={i} style={{background:impersonation?"#ef444415":"#10b98112",border:"1px solid "+(impersonation?"#ef444440":"#10b98130"),borderRadius:7,padding:"8px 10px"}}>
-                            <div style={{fontSize:12,fontWeight:600,color:impersonation?"#fca5a5":"#86efac",display:"flex",alignItems:"center",gap:6}}>
-                              {impersonation?<AlertTriangle size={13}/>:<CheckCircle size={13}/>}
-                              {impersonation?"⚠ Mismo rostro, DOCUMENTO DISTINTO":"Coincide (mismo documento)"}
+                          <div key={i} onClick={()=>openMatchReport(m)} title="Abrir el informe de esta persona" style={{background:danger?"#ef444415":"#10b98112",border:"1px solid "+(danger?"#ef444440":"#10b98130"),borderRadius:7,padding:"8px 10px",cursor:"pointer"}}>
+                            <div style={{fontSize:12,fontWeight:600,color:danger?"#fca5a5":"#86efac",display:"flex",alignItems:"center",gap:6,justifyContent:"space-between"}}>
+                              <span style={{display:"flex",alignItems:"center",gap:6}}>
+                                {danger?<AlertTriangle size={13}/>:<CheckCircle size={13}/>}
+                                {watchHit?"🚨 ROSTRO EN LISTA DE VIGILANCIA":impersonation?"⚠ Mismo rostro, DOCUMENTO DISTINTO":"Coincide (mismo documento)"}
+                              </span>
+                              <span style={{fontSize:10,color:"#64748b",display:"flex",alignItems:"center",gap:3}}><FileText size={11}/>ver informe</span>
                             </div>
                             <div style={{fontSize:11,color:"#cbd5e1",marginTop:2}}>
-                              {m.name||"(sin nombre)"}{m.docNumber?` · ${m.docNumber}`:""} · en {m.source} · confianza {matchConfidence(m.distance)} (dist. {m.distance.toFixed(2)})
+                              {m.name||"(sin nombre)"}{m.docNumber?` · ${m.docNumber}`:""} · en {m.source} · confianza {m.confidence} (dist. {m.distance.toFixed(2)})
                             </div>
                           </div>
                         );
@@ -1978,15 +1990,17 @@ function SettingsPanel({ user, users, setUsers, setUser, watchlist, setWatchlist
     setBkBusy(false);
   };
   // ── Watchlist ──────────────────────────────────────────────────────────────
-  const [wlForm, setWlForm] = useState({ docNumber:"", name:"", reason:"", severity:"Alta" });
+  const [wlForm, setWlForm] = useState({ docNumber:"", name:"", reason:"", severity:"Alta", photo:null });
+  const [wlScan, setWlScan] = useState(false);
   const addWatch = () => {
     const doc = (wlForm.docNumber||"").trim();
     const nm = (wlForm.name||"").trim();
     if (!doc && !nm) return;
-    const entry = { id: Date.now(), docNumber: doc.toUpperCase(), name: nm, reason: (wlForm.reason||"").trim(), severity: wlForm.severity, createdAt: new Date().toISOString(), createdBy: user.name };
+    const entry = { id: Date.now(), docNumber: doc.toUpperCase(), name: nm, reason: (wlForm.reason||"").trim(), severity: wlForm.severity, photo: wlForm.photo||null, createdAt: new Date().toISOString(), createdBy: user.name };
     setWatchlist(prev => [entry, ...(prev||[])]);
     logAudit && logAudit("crear","vigilancia", entry.docNumber || entry.name);
-    setWlForm({ docNumber:"", name:"", reason:"", severity:"Alta" });
+    setWlForm({ docNumber:"", name:"", reason:"", severity:"Alta", photo:null });
+    setWlScan(false);
   };
   const removeWatch = id => {
     const w = (watchlist||[]).find(x => x.id === id);
@@ -2253,6 +2267,19 @@ function SettingsPanel({ user, users, setUsers, setUser, watchlist, setWatchlist
                 <div>
                   <div style={{...S.label,marginBottom:5}}>Severidad</div>
                   <select style={S.select} value={wlForm.severity} onChange={e=>setWlForm(p=>({...p,severity:e.target.value}))}>{["Baja","Media","Alta","Crítica"].map(s=><option key={s}>{s}</option>)}</select>
+                </div>
+                <div style={{borderTop:"1px solid #1a2540",paddingTop:10}}>
+                  <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6}}>
+                    <div style={S.label}>Rostro (cotejo biométrico) {wlForm.photo&&<span style={{color:COLORS.success}}>✓</span>}</div>
+                    <button onClick={()=>setWlScan(s=>!s)} style={{...S.btn(wlScan?"danger":"ghost"),padding:"4px 10px",fontSize:11}}><Camera size={12}/>{wlScan?"Cerrar":"Escanear documento"}</button>
+                  </div>
+                  {wlForm.photo&&(
+                    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
+                      <img src={wlForm.photo} style={{width:42,height:52,objectFit:"cover",borderRadius:6,border:"1px solid #1e2d4a"}} alt="rostro"/>
+                      <span style={{fontSize:11,color:"#64748b"}}>Rostro capturado — se usará para detectar a esta persona aunque cambie de documento.</span>
+                    </div>
+                  )}
+                  {wlScan&&<MiniScanner onExtracted={data=>{ setWlForm(p=>({...p, docNumber:data.documentNumber||p.docNumber, name:data.fullName||((data.firstName||"")+" "+(data.lastName||"")).trim()||p.name, photo:data.personPhoto||p.photo })); setWlScan(false); }}/>}
                 </div>
                 <button onClick={addWatch} style={{...S.btn(),justifyContent:"center"}}><Plus size={14}/>Añadir a vigilancia</button>
               </div>
@@ -2814,6 +2841,8 @@ export default function App() {
   const [pwaInstallable, setPwaInstallable] = useState(false);
   const [saveIndicator, setSaveIndicator] = useState(false);
   const [showNotif, setShowNotif] = useState(false);
+  const [bioStatus, setBioStatus] = useState(null); // { id, label } del motor facial
+  const [bioChecking, setBioChecking] = useState(false);
   const printRef = useRef(null);
 
   // ─── Carga inicial de datos (store cifrado / migración) ───────────────────
@@ -2920,6 +2949,14 @@ export default function App() {
     return () => window.removeEventListener('pwa-installable', handler);
   }, []);
 
+  // ─── Detectar el motor facial activo (InsightFace / local) tras iniciar sesión ──
+  useEffect(() => {
+    if (!user) return;
+    let alive = true;
+    getBioStatus().then(s => { if (alive) setBioStatus(s); }).catch(() => {});
+    return () => { alive = false; };
+  }, [user]);
+
   // ─── Bloqueo de sesión por inactividad (15 min) ───────────────────────────
   useEffect(() => {
     if (!user) return;
@@ -2967,13 +3004,14 @@ export default function App() {
     ppl.forEach(p => { if (p.personPhoto) knownFaces.push({ name: p.fullName || ((p.firstName||"")+" "+(p.lastName||"")).trim(), docNumber: p.documentNumber, photo: p.personPhoto, source: "informe" }); });
   });
   (persons||[]).forEach(m => { if (m.photo) knownFaces.push({ name: m.name, docNumber: m.docNumber, photo: m.photo, source: "mapa" }); });
+  (watchlist||[]).forEach(w => { if (w.photo) knownFaces.push({ name: w.name, docNumber: w.docNumber, photo: w.photo, source: "vigilancia" }); });
 
   const pages = {
     dashboard: <Dashboard incidents={incidents}/>,
     incidents:  <IncidentForm incidents={incidents} setIncidents={setIncidents} onViewReport={handleViewReport} logAudit={logAudit} watchlist={watchlist} mapPersons={persons}/>,
     persons:    <PersonDossier incidents={incidents} onViewReport={handleViewReport}/>,
     networkMap: <Suspense fallback={<div style={{padding:40,color:"#64748b",fontSize:13}}>Cargando mapa…</div>}><NetworkMap persons={persons} setPersons={setPersons} incidents={incidents} theme={theme} setTheme={setTheme} savedMaps={savedMaps} setSavedMaps={setSavedMaps} aiResolved={resolveActiveAI(aiConfig)} watchlist={watchlist}/></Suspense>,
-    scanner:    <OCRScanner watchlist={watchlist} reportedDocs={reportedDocs} knownFaces={knownFaces}/>,
+    scanner:    <OCRScanner watchlist={watchlist} reportedDocs={reportedDocs} knownFaces={knownFaces} incidents={incidents}/>,
     reports:    <ReportGenerator incidents={incidents} user={user} reportCounter={reportCounter} setReportCounter={setReportCounter} onPrintInc={printRef}/>,
     settings:   <SettingsPanel user={user} users={users} setUsers={setUsers} setUser={setUser} watchlist={watchlist} setWatchlist={setWatchlist} onDataRestored={handleDataRestored} audit={audit} logAudit={logAudit} aiConfig={aiConfig} setAiConfig={setAiConfig} reportedDocs={reportedDocs} setReportedDocs={setReportedDocs}/>,
   };
@@ -3019,6 +3057,12 @@ export default function App() {
           )}
           <div style={{...S.badge(COLORS.warning),fontSize:11}}><Clock size={11}/>Turno: {user.shift}</div>
           <div style={{...S.badge(COLORS.success),fontSize:11}}><span className="pulse" style={{fontSize:8}}>●</span> En línea</div>
+          <div
+            onClick={()=>{ if(bioChecking) return; setBioChecking(true); refreshBioStatus().then(s=>{setBioStatus(s);setBioChecking(false);}).catch(()=>setBioChecking(false)); }}
+            title="Motor de reconocimiento facial — clic para volver a detectar el servicio InsightFace"
+            style={{...S.badge(bioStatus&&bioStatus.id==="insightface"?COLORS.success:"#64748b"),fontSize:11,cursor:"pointer"}}>
+            <span style={{fontSize:8}}>{bioChecking?"◌":"●"}</span> Facial: {bioChecking?"…":bioStatus?(bioStatus.id==="insightface"?"InsightFace":"local"):"…"}
+          </div>
           {pwaInstallable&&(
             <button onClick={()=>window.installPWA()} style={{display:"flex",alignItems:"center",gap:6,padding:"5px 10px",borderRadius:7,background:"#f59e0b20",border:"1px solid #f59e0b40",color:"#f59e0b",fontSize:11,cursor:"pointer",fontWeight:500}}>
               ⬇ Instalar App

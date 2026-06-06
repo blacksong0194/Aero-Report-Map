@@ -1,0 +1,2 @@
+# Solo para empaquetar el servicio a .exe (no es necesario en runtime).
+pyinstaller>=6.6

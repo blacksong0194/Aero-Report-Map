@@ -32,6 +32,18 @@ function levenshtein(a, b) {
   return dp[m][n];
 }
 
+// ¿Son probablemente el MISMO documento, tolerando errores de OCR (0/8, 1/I, 5/S…)?
+// Iguales tras normalizar, o distancia de edición pequeña (≤2 en docs largos, ≤1 cortos).
+export function docsLikelySame(a, b) {
+  const na = normalizeDoc(a), nb = normalizeDoc(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  const maxLen = Math.max(na.length, nb.length);
+  if (Math.abs(na.length - nb.length) > 2) return false;
+  const tol = maxLen >= 8 ? 2 : 1;
+  return levenshtein(na, nb) <= tol;
+}
+
 // Devuelve 0..1. 1 = nombres equivalentes; 0.85 = todas las palabras del más corto
 // están en el más largo (tolera segundos nombres, orden y un error de tipeo).
 export function nameSimilarity(a, b) {

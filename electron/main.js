@@ -6,6 +6,9 @@ const fs = require('fs')
 const store = require('./store')
 const { autoUpdater } = require('electron-updater')
 const { callAI } = require('./ai-providers')
+const biometric = require('./biometric-bridge')
+const crypto = require('crypto')
+const { spawn } = require('child_process')
 
 const isDev = process.env.ELECTRON === 'true'
 
@@ -270,6 +273,15 @@ ipcMain.handle('show-open-dialog', async (_, opts) => dialog.showOpenDialog(main
 ipcMain.handle('get-version', () => app.getVersion())
 ipcMain.handle('get-platform', () => process.platform)
 
+// ── Biométrico (sidecar InsightFace, solo loopback) — el renderer nunca toca HTTP ──
+ipcMain.handle('biometric-health', () => biometric.health())
+ipcMain.handle('biometric-extract', (_, { image }) => biometric.extract(image))
+ipcMain.handle('biometric-compare', (_, { image1, image2 }) => biometric.compare(image1, image2))
+ipcMain.handle('biometric-search', (_, { image, topK }) => biometric.search(image, topK))
+ipcMain.handle('biometric-wl-list', () => biometric.watchlistList())
+ipcMain.handle('biometric-wl-add', (_, payload) => biometric.watchlistAdd(payload))
+ipcMain.handle('biometric-wl-remove', (_, { id }) => biometric.watchlistRemove(id))
+
 // ── IA multi-proveedor (Anthropic / OpenAI / Gemini / OpenRouter / compatible / Ollama)
 ipcMain.handle('ai-request', async (_, { config, messages, max_tokens }) => {
   safeLog(`[${new Date().toISOString()}] ai-request: provider=${config && config.provider}, model=${config && config.model}\n`)
@@ -368,6 +380,34 @@ ipcMain.handle('store-restore', async (_, { passphrase }) => {
   }
 })
 
+// ── Servicio facial InsightFace (sidecar, solo en la app empaquetada) ────────
+const FACE_PORT = 8765
+const FACE_TOKEN = crypto.randomBytes(16).toString('hex')
+let faceProc = null
+biometric.configure({ port: FACE_PORT, token: FACE_TOKEN })
+
+function startFaceService() {
+  if (!app.isPackaged) return // en desarrollo el servicio se arranca a mano
+  const exePath = path.join(process.resourcesPath, 'aero-face-service', 'aero-face-service.exe')
+  if (!fs.existsSync(exePath)) { safeLog(`[${new Date().toISOString()}] sidecar facial no encontrado: ${exePath}\n`); return }
+  try {
+    faceProc = spawn(exePath, [], {
+      cwd: path.dirname(exePath),
+      env: { ...process.env, AERO_FACE_PORT: String(FACE_PORT), AERO_FACE_TOKEN: FACE_TOKEN, AERO_FACE_PERSIST: '0' },
+      windowsHide: true,
+      stdio: 'ignore',
+    })
+    faceProc.on('error', (e) => safeLog(`[${new Date().toISOString()}] sidecar facial error: ${e.message}\n`))
+    faceProc.on('exit', (code) => { safeLog(`[${new Date().toISOString()}] sidecar facial salió (${code})\n`); faceProc = null })
+    safeLog(`[${new Date().toISOString()}] sidecar facial lanzado en :${FACE_PORT}\n`)
+  } catch (e) {
+    safeLog(`[${new Date().toISOString()}] sidecar facial excepción: ${e.message}\n`)
+  }
+}
+function stopFaceService() {
+  if (faceProc) { try { faceProc.kill() } catch (e) {} faceProc = null }
+}
+
 // ── Auto-actualización (GitHub Releases) ─────────────────────────────────────
 function setupAutoUpdate() {
   if (isDev) return // no buscar updates en desarrollo
@@ -392,9 +432,13 @@ function setupAutoUpdate() {
 app.whenReady().then(() => {
   createWindow()
   setupAutoUpdate()
+  startFaceService()
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow() })
 })
 
+app.on('before-quit', stopFaceService)
+
 app.on('window-all-closed', () => {
+  stopFaceService()
   if (process.platform !== 'darwin') app.quit()
 })

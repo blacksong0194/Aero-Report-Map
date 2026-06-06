@@ -15,6 +15,18 @@ electron/app.log
 Thumbs.db
 *.tmp
 
+# Servicio Python / biométrico (artefactos, NO van al repo)
+.venv/
+ai-service/.venv/
+ai-service/build/
+ai-service/data/
+__pycache__/
+*.pyc
+*.spec~
+
+# Modelos faciales (regenerables: face-api con `npm run setup:face`; buffalo_l se descarga)
+public/models/
+
 # Entorno / secretos
 .env
 electron-builder.env

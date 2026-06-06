@@ -1,5 +1,20 @@
 import { describe, it, expect } from "vitest";
-import { normalizeDoc, nameSimilarity, findRelatedCases, findDuplicates } from "./person-match.js";
+import { normalizeDoc, nameSimilarity, findRelatedCases, findDuplicates, docsLikelySame } from "./person-match.js";
+
+describe("docsLikelySame (tolerante a OCR)", () => {
+  it("trata como el mismo doc una variación de un dígito (0/8)", () => {
+    expect(docsLikelySame("AF0002266", "AF8002266")).toBe(true);
+  });
+  it("ignora guiones y espacios", () => {
+    expect(docsLikelySame("001-2345678-9", "0012345678 9")).toBe(true);
+  });
+  it("marca como distintos documentos claramente diferentes", () => {
+    expect(docsLikelySame("AF0002266", "XY1234567")).toBe(false);
+  });
+  it("vacío => false", () => {
+    expect(docsLikelySame("", "AF0002266")).toBe(false);
+  });
+});
 
 describe("normalizeDoc", () => {
   it("normaliza guiones y espacios", () => {

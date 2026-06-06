@@ -16,6 +16,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
   storeRestore: (passphrase) => ipcRenderer.invoke('store-restore', { passphrase }),
   exportPDF: (html, defaultName) => ipcRenderer.invoke('export-pdf', { html, defaultName }),
   aiRequest: (payload) => ipcRenderer.invoke('ai-request', payload),
+  // Biométrico (InsightFace vía sidecar) — sin exponer HTTP ni procesos
+  biometric: {
+    health: () => ipcRenderer.invoke('biometric-health'),
+    extract: (image) => ipcRenderer.invoke('biometric-extract', { image }),
+    compare: (image1, image2) => ipcRenderer.invoke('biometric-compare', { image1, image2 }),
+    search: (image, topK) => ipcRenderer.invoke('biometric-search', { image, topK }),
+    watchlistList: () => ipcRenderer.invoke('biometric-wl-list'),
+    watchlistAdd: (payload) => ipcRenderer.invoke('biometric-wl-add', payload),
+    watchlistRemove: (id) => ipcRenderer.invoke('biometric-wl-remove', { id }),
+  },
   isElectron: true,
   platform: process.platform
 })

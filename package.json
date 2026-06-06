@@ -1,6 +1,6 @@
 {
   "name": "aero-report-map",
-  "version": "2.0",
+  "version": "2.0.1",
   "description": "AeroReport Pro - Sistema de novedades aeroportuarias",
   "main": "electron/main.js",
   "author": "AeroReport Pro",
@@ -58,6 +58,13 @@
       "dist/**/*",
       "electron/**/*",
       "!electron/app.log"
+    ],
+    "extraResources": [
+      {
+        "from": "ai-service/dist/aero-face-service",
+        "to": "aero-face-service",
+        "filter": ["**/*"]
+      }
     ],
     "win": {
       "target": [
