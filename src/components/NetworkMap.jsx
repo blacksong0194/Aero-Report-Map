@@ -4,8 +4,19 @@ import html2canvas from 'html2canvas';
 import { 
   Network, GitBranch, CircleDot, List, Plus, X, User, FileText, Image, 
   ArrowRight, Download, Brain, ChevronRight, Trash2, Edit, Search,
-  Maximize2, Minimize2, ZoomIn, ZoomOut, RotateCcw, Link2, Users, CheckCircle
+  Maximize2, Minimize2, ZoomIn, ZoomOut, RotateCcw, Link2, Users, CheckCircle, AlertTriangle
 } from 'lucide-react';
+import { findRelatedCases } from '../lib/person-match.js';
+
+// Construye el texto enumerado de casos asociados (informes + vigilancia)
+function buildCasesNote(related) {
+  const lines = [];
+  (related.cases || []).forEach((c, i) => {
+    lines.push(`${i + 1}. ${c.label}${c.date ? ` (${c.date})` : ""}${c.area ? " · " + c.area : ""}${c.status ? " · " + c.status : ""}`);
+  });
+  (related.watch || []).forEach((w) => lines.push(`⚠ Vigilancia: ${w.reason || w.severity || "interés"}`));
+  return lines.length ? "Casos asociados:\n" + lines.join("\n") : "";
+}
 
 const ROLE_COLORS = {
   líder: '#f59e0b',
@@ -205,7 +216,7 @@ function AddEventModal({ nodes, setEvents, setShowAddEvent, ROLE_COLORS }) {
   );
 }
 
-function NetworkMap({ persons: externalPersons, setPersons, incidents: externalIncidents, theme: externalTheme, setTheme: externalSetTheme, savedMaps = [], setSavedMaps, aiResolved }) {
+function NetworkMap({ persons: externalPersons, setPersons, incidents: externalIncidents, theme: externalTheme, setTheme: externalSetTheme, savedMaps = [], setSavedMaps, aiResolved, watchlist = [] }) {
   const [internalTheme, setInternalTheme] = useState('dark');
   const theme = externalTheme || internalTheme;
   const setTheme = externalSetTheme || setInternalTheme;
@@ -648,8 +659,16 @@ Responde en español con un análisis detallado en máximo 300 palabras.`;
 
   const handleAddPerson = () => {
     if (!newPerson.name.trim()) return;
+    // Búsqueda inteligente: casos asociados desde informes + vigilancia
+    const related = findRelatedCases(
+      { name: newPerson.name, docNumber: newPerson.docNumber },
+      externalIncidents, watchlist
+    );
+    const autoNote = buildCasesNote(related);
+    const notes = [newPerson.notes && newPerson.notes.trim(), autoNote].filter(Boolean).join("\n\n");
     const person = {
       ...newPerson,
+      notes,
       id: Date.now()
     };
     setNodes([...nodes, person]);
@@ -1218,8 +1237,38 @@ return (
 
             <div style={S.sep} />
 
+            {(() => {
+              const rel = findRelatedCases({ name: selectedNode.name, docNumber: selectedNode.docNumber }, externalIncidents, watchlist);
+              return (
+                <div style={{ marginBottom: 12 }}>
+                  <div style={{ ...S.label, marginBottom: 6 }}>Casos asociados (informes / vigilancia)</div>
+                  {rel.cases.length === 0 && rel.watch.length === 0 ? (
+                    <div style={{ fontSize: 11, color: '#475569' }}>Sin casos asociados</div>
+                  ) : (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                      {rel.cases.map((c, i) => (
+                        <div key={c.id} style={{ background: '#0b1020', borderRadius: 6, padding: '6px 8px' }}>
+                          <div style={{ fontSize: 11, color: '#e2e8f0' }}>{i + 1}. {c.label}</div>
+                          <div style={{ fontSize: 10, color: '#475569', marginTop: 1 }}>
+                            {c.date ? c.date + ' · ' : ''}{c.area}{c.status ? ' · ' + c.status : ''} · {c.matchType === 'exact' ? 'doc exacto' : 'nombre'}
+                          </div>
+                        </div>
+                      ))}
+                      {rel.watch.map((w) => (
+                        <div key={'w' + w.id} style={{ background: '#ef444412', border: '1px solid #ef444430', borderRadius: 6, padding: '6px 8px' }}>
+                          <div style={{ fontSize: 11, color: '#fca5a5', display: 'flex', alignItems: 'center', gap: 6 }}>
+                            <AlertTriangle size={11} /> Vigilancia: {w.reason || w.severity}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+
             <div style={{ marginBottom: 12 }}>
-              <div style={{ ...S.label, marginBottom: 4 }}>Incidentes Vinculados</div>
+              <div style={{ ...S.label, marginBottom: 4 }}>Conexiones en el mapa</div>
               <div style={{ fontSize: 24, fontWeight: 700, color: '#f59e0b', fontFamily: "'Barlow Condensed',sans-serif" }}>
                 {getConnectedIncidents(selectedNode.id)}
               </div>
@@ -1376,6 +1425,29 @@ return (
                 />
               </div>
             </div>
+
+            {(() => {
+              const rel = findRelatedCases({ name: newPerson.name, docNumber: newPerson.docNumber }, externalIncidents, watchlist);
+              const total = rel.cases.length + rel.watch.length;
+              if (!total) return null;
+              return (
+                <div style={{ marginTop: 12, background: '#0b1020', border: '1px solid #f59e0b40', borderRadius: 8, padding: '10px 12px' }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: '#f59e0b', marginBottom: 6 }}>
+                    🔎 {total} caso(s) asociado(s) — se añadirán a la descripción
+                  </div>
+                  {rel.cases.map((c, i) => (
+                    <div key={c.id} style={{ fontSize: 11, color: '#94a3b8', marginBottom: 2 }}>
+                      {i + 1}. {c.label}{c.date ? ` (${c.date})` : ''} · {c.area}{c.matchType === 'exact' ? ' · doc exacto' : ' · nombre'}
+                    </div>
+                  ))}
+                  {rel.watch.map((w) => (
+                    <div key={'w' + w.id} style={{ fontSize: 11, color: '#fca5a5', marginBottom: 2 }}>
+                      ⚠ Vigilancia: {w.reason || w.severity}
+                    </div>
+                  ))}
+                </div>
+              );
+            })()}
 
             <div style={{ display: 'flex', gap: 8, marginTop: 16 }}>
               <button onClick={() => setShowAddPerson(false)} style={{ ...S.btn('ghost'), flex: 1, justifyContent: 'center' }}>

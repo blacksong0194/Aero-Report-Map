@@ -7,7 +7,14 @@ const NetworkMap = lazy(() => import("./components/NetworkMap"));
 import { hashPassword, verifyPassword } from "./lib/security.js";
 import { buildReportNumber, todayStr } from "./lib/format.js";
 import { matchWatchlist } from "./lib/watchlist.js";
-import { parseMRZRobust } from "./lib/mrz.js";
+import { parseMRZRobust, documentExpiryStatus } from "./lib/mrz.js";
+import { findDuplicates } from "./lib/person-match.js";
+import { buildNotifications } from "./lib/notifications.js";
+import { matchReportedDoc, REPORTED_TYPES } from "./lib/reported-docs.js";
+import { parseReportedRows } from "./lib/import-reported.js";
+import * as XLSX from "xlsx";
+import { bestFaceMatches, matchConfidence } from "./lib/face-match.js";
+import { getFaceDescriptor } from "./face-service.js";
 
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
 const COLORS = { primary: "#f59e0b", danger: "#ef4444", success: "#10b981", info: "#6366f1", warning: "#f97316" };
@@ -33,8 +40,10 @@ const AIRPORT = { name:"Aeropuerto Internacional de Punta Cana", iata:"PUJ", cod
 const ANTHROPIC_API_KEY = "PEGA_AQUI_TU_CLAVE_sk-ant-";
 // ─────────────────────────────────────────────────────────────────────────────
 
-// OCR.space API - Alternativa a Tesseract
-const OCR_SPACE_KEY = "helloworld"; // Key gratuita (5000/month)
+// OCR.space API - Alternativa a Tesseract. La clave la configura el usuario en Ajustes;
+// "helloworld" es la clave pública de demostración (compartida y muy limitada).
+let _ocrSpaceKey = "helloworld";
+function setOcrSpaceKey(k) { _ocrSpaceKey = (k && k.trim()) ? k.trim() : "helloworld"; }
 async function callOCRspace(imageBase64, language = "spa") {
   const formData = new FormData();
   formData.append("base64Image", `data:image/jpeg;base64,${imageBase64}`);
@@ -46,7 +55,7 @@ async function callOCRspace(imageBase64, language = "spa") {
   
   const response = await fetch("https://api.ocr.space/parse/image", {
     method: "POST",
-    headers: { apikey: OCR_SPACE_KEY },
+    headers: { apikey: _ocrSpaceKey },
     body: formData
   });
   
@@ -67,6 +76,7 @@ const AI_PROVIDER_LABELS = {
 };
 const DEFAULT_AI = {
   provider: "anthropic",
+  ocrSpaceKey: "",
   settings: {
     anthropic:  { apiKey:"", model:"claude-sonnet-4-6" },
     openai:     { apiKey:"", model:"gpt-4o" },
@@ -80,6 +90,7 @@ function normalizeAIConfig(cfg) {
   const base = JSON.parse(JSON.stringify(DEFAULT_AI));
   if (!cfg) return base;
   if (cfg.provider && AI_PROVIDERS.includes(cfg.provider)) base.provider = cfg.provider;
+  if (cfg.ocrSpaceKey) base.ocrSpaceKey = cfg.ocrSpaceKey;
   if (cfg.settings) for (const p of AI_PROVIDERS) base.settings[p] = { ...base.settings[p], ...(cfg.settings[p]||{}) };
   return base;
 }
@@ -90,7 +101,7 @@ function resolveActiveAI(cfg) {
 }
 // Espejo a nivel de módulo para que callAnthropicAPI lo lea sin props
 let _activeAI = DEFAULT_AI;
-function setModuleAI(cfg) { _activeAI = normalizeAIConfig(cfg); }
+function setModuleAI(cfg) { _activeAI = normalizeAIConfig(cfg); setOcrSpaceKey(_activeAI.ocrSpaceKey); }
 function getActiveProvider() { return _activeAI.provider; }
 function activeKeyConfigured() { const a = resolveActiveAI(_activeAI); return a.provider==="ollama" || !!a.apiKey; }
 
@@ -539,8 +550,115 @@ function Dashboard({ incidents }) {
   );
 }
 
+// HTML autónomo del informe de una novedad (para abrir en ventana aparte)
+function buildIncidentWindowHTML(inc) {
+  const persons = (inc.persons && inc.persons.length) ? inc.persons : (inc.person ? [inc.person] : []);
+  const sc = inc.severity === "Crítica" || inc.severity === "Alta" ? "#dc2626" : inc.severity === "Media" ? "#ea580c" : "#059669";
+  const statusBg = inc.status === "Resuelto" ? "#d1fae5;color:#065f46" : inc.status === "Escalado" ? "#fee2e2;color:#991b1b" : "#fff7ed;color:#92400e";
+  const esc = (s) => (s == null ? "" : String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"));
+  const personRows = persons.map((p, i) => `
+    <div style="display:flex;gap:12px;align-items:flex-start;border:1px solid #e5e7eb;border-radius:8px;padding:10px;margin-bottom:8px;">
+      ${p.personPhoto ? `<img src="${p.personPhoto}" style="width:60px;height:74px;object-fit:cover;border-radius:6px;border:1px solid #e5e7eb;"/>` : ""}
+      <div style="flex:1;">
+        <div style="font-weight:700;color:#1a2744;">${persons.length > 1 ? `#${i + 1} ` : ""}${esc(p.fullName || ((p.firstName || "") + " " + (p.lastName || "")).trim() || "Sin nombre")}</div>
+        <div style="font-size:12px;color:#374151;margin-top:4px;">
+          ${p.documentNumber ? `Doc: <b>${esc(p.documentNumber)}</b> · ` : ""}${p.nationality ? `Nac.: ${esc(p.nationality)} · ` : ""}${p.dateOfBirth ? `F. Nac.: ${esc(p.dateOfBirth)} · ` : ""}${p.gender ? esc(p.gender) : ""}
+        </div>
+      </div>
+    </div>`).join("");
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Informe — ${esc(inc.reportName || inc.area || "Novedad")}</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:Arial,sans-serif;color:#111;background:#f3f4f6;font-size:13px;padding:24px;}
+.page{max-width:760px;margin:0 auto;background:#fff;border-radius:10px;overflow:hidden;box-shadow:0 2px 10px rgba(0,0,0,0.08);}
+.hdr{background:#1a2744;color:#fff;padding:18px 24px;border-bottom:3px solid #c8a94a;}
+.hdr h1{font-size:18px;}.hdr .sub{font-size:12px;color:#c8a94a;margin-top:3px;}
+.body{padding:22px 24px;}
+.badges{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 16px;}
+.badge{font-size:11px;padding:3px 12px;border-radius:12px;font-weight:700;}
+.case-title{font-size:18px;font-weight:800;color:#1a2744;margin-bottom:6px;}
+.meta{font-size:12px;color:#374151;margin-bottom:14px;}
+.sec{margin-top:16px;}.sec h3{font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;}
+.sec p{font-size:13px;color:#1f2937;line-height:1.6;white-space:pre-wrap;}
+@media print{body{background:#fff;padding:0;}.page{box-shadow:none;}}
+</style></head><body>
+<div class="page">
+  <div class="hdr"><h1>✈ ${esc(AIRPORT.name)}</h1><div class="sub">${esc(AIRPORT.code)} · Informe de Novedad (coincidencia)</div></div>
+  <div class="body">
+    <div class="case-title">${esc(inc.reportName || "Novedad — " + (inc.area || ""))}</div>
+    <div class="badges">
+      <span class="badge" style="background:#f1f5f9;color:${sc};border:1px solid ${sc}40;">${esc(inc.severity || "")}</span>
+      <span class="badge" style="background:${statusBg};">${esc(inc.status || "")}</span>
+      <span class="badge" style="background:#eef2ff;color:#3730a3;">${esc(inc.area || "")}</span>
+    </div>
+    <div class="meta">
+      ${inc.date ? `Fecha: <b>${esc(inc.date)}</b> · ` : ""}${inc.time ? `Hora: <b>${esc(inc.time)}</b>` : ""}
+      ${inc.flightNumber ? ` · Vuelo: <b>${esc(inc.flightNumber)}</b>` : ""}${inc.airline ? ` (${esc(inc.airline)})` : ""}
+      ${inc.origin ? ` · ${esc(inc.origin)}` : ""}
+    </div>
+    ${inc.description ? `<div class="sec"><h3>Descripción</h3><p>${esc(inc.description)}</p></div>` : ""}
+    ${inc.actions ? `<div class="sec"><h3>Acciones tomadas</h3><p>${esc(inc.actions)}</p></div>` : ""}
+    ${persons.length ? `<div class="sec"><h3>Personas involucradas</h3>${personRows}</div>` : ""}
+  </div>
+</div>
+</body></html>`;
+}
+
+// Genera un CSV (compatible con Excel) de una lista de novedades y lo descarga.
+function exportIncidentsCSV(incidents) {
+  const header = ["Fecha","Hora","Caso","Área","Severidad","Estado","Vuelo","Aerolínea","Origen/Destino","Descripción","Acciones","Personas"];
+  const esc = (v) => { const s = (v == null ? "" : String(v)).replace(/"/g, '""'); return /[",\n;]/.test(s) ? `"${s}"` : s; };
+  const rows = (incidents || []).map((i) => {
+    const personas = ((i.persons && i.persons.length) ? i.persons : (i.person ? [i.person] : []))
+      .map((p) => p.fullName || ((p.firstName||"")+" "+(p.lastName||"")).trim()).filter(Boolean).join("; ");
+    return [i.date, i.time, i.reportName, i.area, i.severity, i.status, i.flightNumber, i.airline, i.origin, i.description, i.actions, personas].map(esc).join(",");
+  });
+  const csv = "﻿" + header.map(esc).join(",") + "\n" + rows.join("\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = `novedades-${todayStr()}.csv`;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 // ─── INCIDENT FORM ────────────────────────────────────────────────────────────
-function IncidentForm({ incidents, setIncidents, onViewReport, logAudit }) {
+function IncidentForm({ incidents, setIncidents, onViewReport, logAudit, watchlist = [], mapPersons = [] }) {
+  const [personAlert, setPersonAlert] = useState(null);
+  // Universo de personas conocidas: informes + mapa + vigilancia
+  const buildKnownPersons = () => {
+    const known = [];
+    for (const inc of incidents) {
+      const ppl = (inc.persons && inc.persons.length) ? inc.persons : (inc.person ? [inc.person] : []);
+      for (const p of ppl) known.push({ name: p.fullName || ((p.firstName||"")+" "+(p.lastName||"")).trim(), docNumber: p.documentNumber, source: "informe", label: inc.reportName || (inc.area+" — "+(inc.time||"")), incident: inc });
+    }
+    for (const m of (mapPersons||[])) known.push({ name: m.name, docNumber: m.docNumber, source: "mapa", label: "Mapa de personas" });
+    for (const w of (watchlist||[])) known.push({ name: w.name, docNumber: w.docNumber, source: "vigilancia", label: w.reason || "Lista de vigilancia" });
+    return known;
+  };
+  // Verifica coincidencias y abre el diálogo si las hay
+  const checkPersonMatch = (data, pid) => {
+    const dup = findDuplicates(
+      { fullName: data.fullName || ((data.firstName||"")+" "+(data.lastName||"")).trim(), documentNumber: data.documentNumber },
+      buildKnownPersons()
+    );
+    const personName = data.fullName || ((data.firstName||"")+" "+(data.lastName||"")).trim() || "Persona";
+    if (dup.exact.length) setPersonAlert({ type: "exact", items: dup.exact, pid, personName });
+    else if (dup.similar.length) setPersonAlert({ type: "similar", items: dup.similar, pid, personName });
+    else setPersonAlert(null);
+  };
+  // Abre el informe de la coincidencia en una ventana aparte, sin salir del formulario
+  const goToMatchReport = (inc) => {
+    if (!inc) return;
+    const w = window.open("", "_blank", "width=820,height=900");
+    if (!w) return;
+    w.document.write(buildIncidentWindowHTML(inc));
+    w.document.close();
+  };
+  const removeAlertedPerson = () => {
+    if (personAlert && personAlert.pid) setForm(pr => ({ ...pr, persons: pr.persons.filter(x => x._pid !== personAlert.pid) }));
+    setPersonAlert(null);
+  };
   const empty = { reportName:"", date:todayStr(), time:"", area:AREAS[0], flightNumber:"", airline:"", origin:"", description:"", actions:"", status:STATUSES[0], severity:"Media", evidence:[], persons:[] };
   const [form, setForm] = useState(empty);
   const [search, setSearch] = useState("");
@@ -693,9 +811,43 @@ function IncidentForm({ incidents, setIncidents, onViewReport, logAudit }) {
                   </div>
                 )}
                 {showScanner&&<MiniScanner onExtracted={data=>{
-                  setForm(p=>({...p,persons:[...p.persons,{...data,_pid:Date.now()+Math.random()}]}));
+                  const pid = Date.now()+Math.random();
+                  setForm(p=>({...p,persons:[...p.persons,{...data,_pid:pid}]}));
+                  checkPersonMatch(data, pid);
                   setShowScanner(false);
                 }}/>}
+                {personAlert&&(
+                  <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.72)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:2000}} onClick={()=>setPersonAlert(null)}>
+                    <div onClick={e=>e.stopPropagation()} className="fade-in" style={{background:"#0f1629",border:"1px solid "+(personAlert.type==="exact"?"#ef444450":"#f9731650"),borderRadius:12,padding:22,width:470,maxHeight:"82vh",overflow:"auto"}}>
+                      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
+                        <AlertTriangle size={20} color={personAlert.type==="exact"?"#ef4444":"#f97316"}/>
+                        <div style={{...S.h2,color:personAlert.type==="exact"?"#ef4444":"#f97316"}}>
+                          {personAlert.type==="exact"?"Coincidencia exacta (100%)":"Posible similitud"}
+                        </div>
+                      </div>
+                      <div style={{fontSize:12,color:"#94a3b8",marginBottom:14,lineHeight:1.6}}>
+                        <b style={{color:"#e2e8f0"}}>{personAlert.personName}</b> {personAlert.type==="exact"?"ya figura registrada":"se parece a alguien ya registrado"}. Verifica si es la misma persona:
+                      </div>
+                      <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:16}}>
+                        {personAlert.items.map((it,i)=>(
+                          <div key={i} style={{background:"#0b1020",border:"1px solid #1e2d4a",borderRadius:8,padding:"10px 12px"}}>
+                            <div style={{fontSize:13,color:"#e2e8f0",fontWeight:600}}>{it.name||"(sin nombre)"}</div>
+                            <div style={{fontSize:11,color:"#64748b",marginTop:3,display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
+                              {it.docNumber&&<span style={{fontFamily:"'JetBrains Mono',monospace",color:COLORS.primary}}>{it.docNumber}</span>}
+                              <span style={S.badge(it.source==="informe"?COLORS.info:it.source==="vigilancia"?COLORS.danger:COLORS.warning)}>{it.source}</span>
+                              <span>{it.label}</span>
+                            </div>
+                            {it.incident&&<button onClick={()=>goToMatchReport(it.incident)} style={{...S.btn(),padding:"5px 12px",fontSize:12,marginTop:8}}><FileText size={13}/>Ir al informe</button>}
+                          </div>
+                        ))}
+                      </div>
+                      <div style={{display:"flex",gap:8}}>
+                        <button onClick={()=>setPersonAlert(null)} style={{...S.btn("ghost"),flex:1,justifyContent:"center"}}><CheckCircle size={14}/>Mantener y continuar</button>
+                        <button onClick={removeAlertedPerson} style={{...S.btn("danger"),padding:"8px 14px"}}><Trash2 size={13}/>Quitar</button>
+                      </div>
+                    </div>
+                  </div>
+                )}
                 {form.persons.length===0&&!showScanner&&(
                   <div style={{border:"1px dashed #1e2d4a",borderRadius:8,padding:"10px 14px",textAlign:"center",background:"#0b1020"}}>
                     <div style={{fontSize:11,color:"#334155"}}>No hay personas registradas — use "+ Agregar Persona" para escanear documentos</div>
@@ -738,7 +890,10 @@ function IncidentForm({ incidents, setIncidents, onViewReport, logAudit }) {
               </div>
               {anyFilter&&<button onClick={clearFilters} style={{...S.btn("ghost"),padding:"7px 10px",fontSize:11}}><XCircle size={12}/>Limpiar</button>}
             </div>
-            <div style={{fontSize:11,color:"#475569",marginTop:8}}>{filtered.length} de {incidents.length} novedades</div>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:8}}>
+              <div style={{fontSize:11,color:"#475569"}}>{filtered.length} de {incidents.length} novedades</div>
+              <button onClick={()=>exportIncidentsCSV(filtered)} disabled={filtered.length===0} style={{...S.btn("ghost"),padding:"5px 10px",fontSize:11,opacity:filtered.length===0?0.5:1}} title="Exportar a CSV/Excel"><FileText size={12}/>Exportar CSV</button>
+            </div>
           </div>
           <div style={{display:"flex",flexDirection:"column",gap:8}}>
             {filtered.map(inc=>(
@@ -799,6 +954,8 @@ function parseMRZ(text) {
       expiryDate: robust.expiryDate || "",
       issuingCountry: robust.issuingCountry || "",
       mrz: "",
+      mrzValid: robust.mrzValid,
+      checks: robust.checks,
       confidence: "alta",
       notes: "Datos extraídos del MRZ (OCR)",
     };
@@ -936,6 +1093,7 @@ function extractFromText(text, docType) {
     for (const k of ["documentNumber","nationality","issuingCountry","dateOfBirth","gender","expiryDate","firstName","lastName","fullName"]) {
       if (mrzData[k]) r[k] = mrzData[k];
     }
+    if (mrzData.mrzValid !== undefined) { r.mrzValid = mrzData.mrzValid; r.checks = mrzData.checks; }
     if (r.documentNumber && r.dateOfBirth) { r.confidence = "alta"; r.notes = "Datos extraídos del MRZ (OCR)"; }
   }
 
@@ -1039,8 +1197,10 @@ function extractFromText(text, docType) {
  // ─── FULL OCR SCANNER PAGE ────────────────────────────────────────────────────
 // matchWatchlist ahora vive en ./lib/watchlist.js (importado arriba)
 
-function OCRScanner({ watchlist }) {
+function OCRScanner({ watchlist, reportedDocs = [], knownFaces = [] }) {
   const [img, setImg] = useState(null);
+  const [faceChecking, setFaceChecking] = useState(false);
+  const [faceResult, setFaceResult] = useState(null); // {matches:[], error?}
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState("");
@@ -1053,7 +1213,25 @@ function OCRScanner({ watchlist }) {
   const [showRaw, setShowRaw] = useState(false);
   const fileRef = useRef();
 
-  const handleFile = f=>{ const r=new FileReader(); r.onload=e=>{setImg(e.target.result);setResult(null);setError("");setShowCrop(false);setRawText("");setTProgress(0);}; r.readAsDataURL(f); };
+  const handleFile = f=>{ const r=new FileReader(); r.onload=e=>{setImg(e.target.result);setResult(null);setError("");setShowCrop(false);setRawText("");setTProgress(0);setFaceResult(null);}; r.readAsDataURL(f); };
+
+  // Cotejo biométrico: compara el rostro escaneado contra los rostros registrados
+  const handleFaceCheck = async () => {
+    if (!result || !result.personPhoto) return;
+    setFaceChecking(true); setFaceResult(null);
+    try {
+      const scanned = await getFaceDescriptor(result.personPhoto);
+      if (!scanned) { setFaceResult({ error: "No se detectó un rostro en la foto escaneada." }); setFaceChecking(false); return; }
+      const candidates = [];
+      for (const kf of knownFaces) {
+        try { const d = await getFaceDescriptor(kf.photo); if (d) candidates.push({ ...kf, descriptor: d }); } catch (e) {}
+      }
+      setFaceResult({ matches: bestFaceMatches(scanned, candidates), checked: candidates.length });
+    } catch (e) {
+      setFaceResult({ error: "No se pudo verificar: " + e.message + ". ¿Copiaste los modelos con \"npm run setup:face\"?" });
+    }
+    setFaceChecking(false);
+  };
 
   // ─── Modo Claude Vision API ──────────────────────────────────────────────
   const analyzeClaude = async()=>{
@@ -1257,6 +1435,19 @@ faceX,faceY,faceW,faceH son NÚMEROS 0-100 indicando posición porcentual del RO
         <div style={{flex:1}}>
           {result?(
             <div style={S.card} className="fade-in">
+              {matchReportedDoc(result.documentNumber, reportedDocs).length>0 && (
+                <div className="pulse" style={{background:"#7f1d1d",border:"2px solid #ef4444",borderRadius:10,padding:"12px 14px",marginBottom:14}}>
+                  <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+                    <AlertTriangle size={20} color="#fff"/>
+                    <span style={{fontSize:15,fontWeight:800,color:"#fff"}}>🚫 DOCUMENTO REPORTADO</span>
+                  </div>
+                  {matchReportedDoc(result.documentNumber, reportedDocs).map(rd=>(
+                    <div key={rd.id} style={{fontSize:12,color:"#fecaca",marginTop:2}}>
+                      <span style={{fontFamily:"'JetBrains Mono',monospace"}}>{rd.docNumber}</span> · <b style={{textTransform:"uppercase"}}>{rd.type}</b>{rd.reason?` — ${rd.reason}`:""}
+                    </div>
+                  ))}
+                </div>
+              )}
               {matchWatchlist(result, watchlist).length>0 && (
                 <div className="pulse" style={{background:"#ef444418",border:"1px solid #ef444455",borderRadius:10,padding:"12px 14px",marginBottom:14}}>
                   <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
@@ -1273,10 +1464,22 @@ faceX,faceY,faceW,faceH son NÚMEROS 0-100 indicando posición porcentual del RO
                   ))}
                 </div>
               )}
-              <div style={{...S.flex,marginBottom:14,justifyContent:"space-between"}}>
+              <div style={{...S.flex,marginBottom:10,justifyContent:"space-between"}}>
                 <div style={S.h2}>Datos Extraídos</div>
                 <div style={S.badge(CONF[result.confidence]||COLORS.warning)}>Confianza: {result.confidence||"media"}</div>
               </div>
+              {(() => {
+                const exp = documentExpiryStatus(result.expiryDate);
+                const badges = [];
+                if (result.mrzValid === true) badges.push(<span key="mrz" style={S.badge(COLORS.success)}><CheckCircle size={11}/>MRZ válido</span>);
+                else if (result.mrzValid === false) badges.push(<span key="mrz" style={S.badge(COLORS.danger)}><AlertTriangle size={11}/>MRZ no coincide — revise</span>);
+                if (exp) {
+                  if (exp.status === "vencido") badges.push(<span key="exp" style={S.badge(COLORS.danger)}><AlertTriangle size={11}/>Documento VENCIDO</span>);
+                  else if (exp.status === "por_vencer") badges.push(<span key="exp" style={S.badge(COLORS.warning)}><Clock size={11}/>Vence en {exp.days} días</span>);
+                  else badges.push(<span key="exp" style={S.badge(COLORS.success)}><CheckCircle size={11}/>Vigente</span>);
+                }
+                return badges.length ? <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:14}}>{badges}</div> : null;
+              })()}
               <div style={{display:"flex",gap:16,marginBottom:14}}>
                 {result.personPhoto&&(
                   <div style={{flexShrink:0}}>
@@ -1294,6 +1497,37 @@ faceX,faceY,faceW,faceH son NÚMEROS 0-100 indicando posición porcentual del RO
                     </div>)}
                 </div>
               </div>
+              {result.personPhoto&&(
+                <div style={{background:"#0b1020",borderRadius:8,padding:"10px 12px",marginBottom:11,border:"1px solid #1e2d4a"}}>
+                  <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:10}}>
+                    <div style={{fontSize:12,color:"#94a3b8"}}>Cotejo biométrico contra {knownFaces.length} rostro(s) registrado(s)</div>
+                    <button onClick={handleFaceCheck} disabled={faceChecking||knownFaces.length===0} style={{...S.btn("ghost"),padding:"5px 12px",fontSize:12,opacity:(faceChecking||knownFaces.length===0)?0.6:1}}>
+                      <User size={13}/>{faceChecking?"Verificando…":"Verificar rostro"}
+                    </button>
+                  </div>
+                  {faceResult&&faceResult.error&&<div style={{fontSize:11,color:"#ef4444",marginTop:8}}>{faceResult.error}</div>}
+                  {faceResult&&!faceResult.error&&faceResult.matches.length===0&&<div style={{fontSize:11,color:COLORS.success,marginTop:8}}>● Sin coincidencias faciales ({faceResult.checked} comparados).</div>}
+                  {faceResult&&!faceResult.error&&faceResult.matches.length>0&&(
+                    <div style={{marginTop:8,display:"flex",flexDirection:"column",gap:6}}>
+                      {faceResult.matches.map((m,i)=>{
+                        const sameDoc = m.docNumber && result.documentNumber && m.docNumber.toUpperCase().replace(/\s/g,"")===result.documentNumber.toUpperCase().replace(/\s/g,"");
+                        const impersonation = !sameDoc;
+                        return (
+                          <div key={i} style={{background:impersonation?"#ef444415":"#10b98112",border:"1px solid "+(impersonation?"#ef444440":"#10b98130"),borderRadius:7,padding:"8px 10px"}}>
+                            <div style={{fontSize:12,fontWeight:600,color:impersonation?"#fca5a5":"#86efac",display:"flex",alignItems:"center",gap:6}}>
+                              {impersonation?<AlertTriangle size={13}/>:<CheckCircle size={13}/>}
+                              {impersonation?"⚠ Mismo rostro, DOCUMENTO DISTINTO":"Coincide (mismo documento)"}
+                            </div>
+                            <div style={{fontSize:11,color:"#cbd5e1",marginTop:2}}>
+                              {m.name||"(sin nombre)"}{m.docNumber?` · ${m.docNumber}`:""} · en {m.source} · confianza {matchConfidence(m.distance)} (dist. {m.distance.toFixed(2)})
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
               {result.mrz&&<div style={{background:"#0b1020",borderRadius:7,padding:"9px 11px",marginBottom:11}}>
                 <div style={{...S.label,marginBottom:4}}>MRZ</div>
                 <div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:10,color:"#94a3b8",wordBreak:"break-all"}}>{result.mrz}</div>
@@ -1709,7 +1943,7 @@ h2{font-size:12px;font-weight:800;color:#1a2744;border-bottom:2px solid #c8a94a;
 
 
 // ─── SETTINGS PANEL ───────────────────────────────────────────────────────────
-function SettingsPanel({ user, users, setUsers, setUser, watchlist, setWatchlist, onDataRestored, audit = [], logAudit, aiConfig, setAiConfig }) {
+function SettingsPanel({ user, users, setUsers, setUser, watchlist, setWatchlist, onDataRestored, audit = [], logAudit, aiConfig, setAiConfig, reportedDocs = [], setReportedDocs }) {
   const isAdmin = user.role === "admin";
   const [tab, setTab] = useState("password"); // "password" | "users" | "ai" | "backup" | "watchlist" | "audit"
   // ── Respaldo / restauración ────────────────────────────────────────────────
@@ -1758,6 +1992,52 @@ function SettingsPanel({ user, users, setUsers, setUser, watchlist, setWatchlist
     const w = (watchlist||[]).find(x => x.id === id);
     setWatchlist(prev => (prev||[]).filter(w => w.id !== id));
     logAudit && logAudit("eliminar","vigilancia", w ? (w.docNumber||w.name) : ("#"+id));
+  };
+  // ── Documentos reportados (robados / perdidos / invalidados) ───────────────
+  const [rdForm, setRdForm] = useState({ docNumber:"", type:"robado", name:"", reason:"" });
+  const addReported = () => {
+    const doc = (rdForm.docNumber||"").trim();
+    if (!doc) return;
+    const entry = { id: Date.now(), docNumber: doc.toUpperCase(), type: rdForm.type, name:(rdForm.name||"").trim(), reason:(rdForm.reason||"").trim(), createdAt: new Date().toISOString(), createdBy: user.name };
+    setReportedDocs(prev => [entry, ...(prev||[])]);
+    logAudit && logAudit("crear","documento reportado", entry.docNumber);
+    setRdForm({ docNumber:"", type:"robado", name:"", reason:"" });
+  };
+  const removeReported = id => {
+    const r = (reportedDocs||[]).find(x => x.id === id);
+    setReportedDocs(prev => (prev||[]).filter(x => x.id !== id));
+    logAudit && logAudit("eliminar","documento reportado", r ? r.docNumber : ("#"+id));
+  };
+  // ── Importación masiva desde Excel/CSV ──────────────────────────────────────
+  const [rdMsg, setRdMsg] = useState(null);
+  const rdFileRef = useRef(null);
+  const importReported = async (file) => {
+    setRdMsg(null);
+    if (!file) return;
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: "array" });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
+      const { entries, duplicates, invalid } = parseReportedRows(rows, reportedDocs);
+      if (entries.length) {
+        const stamped = entries.map(e => ({ ...e, id: Date.now() + Math.random(), createdAt: new Date().toISOString(), createdBy: user.name }));
+        setReportedDocs(prev => [...stamped, ...(prev||[])]);
+        logAudit && logAudit("crear", "documento reportado", `importación masiva: ${entries.length} documento(s)`);
+      }
+      setRdMsg({ type: entries.length ? "ok" : "err", text: `${entries.length} importados · ${duplicates} duplicados · ${invalid} sin documento.` });
+    } catch (e) {
+      setRdMsg({ type: "err", text: "No se pudo leer el archivo: " + e.message });
+    }
+  };
+  const downloadReportedTemplate = () => {
+    const csv = "documento,tipo,titular,motivo\nAF0002266,robado,Juan Perez,Reporte policial 123\nX1234567,perdido,Maria Lopez,Denuncia 456\n";
+    const blob = new Blob(["﻿" + csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "plantilla-documentos-reportados.csv";
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   };
   // ── Configuración de IA multi-proveedor ────────────────────────────────────
   const [showKey, setShowKey] = useState(false);
@@ -1847,7 +2127,7 @@ function SettingsPanel({ user, users, setUsers, setUser, watchlist, setWatchlist
 
       {/* Tabs */}
       <div style={{display:"flex",gap:6,marginBottom:20,background:"#0b1020",border:"1px solid #1e2d4a",borderRadius:10,padding:4,width:"fit-content"}}>
-        {[["password","🔑 Cambiar Contraseña"], ["ai","🤖 IA / API"], ["watchlist","🚨 Vigilancia"], ...(isAdmin?[["users","👥 Gestión de Usuarios"],["backup","💾 Respaldo"],["audit","📋 Auditoría"]]:[])]
+        {[["password","🔑 Cambiar Contraseña"], ["ai","🤖 IA / API"], ["watchlist","🚨 Vigilancia"], ["reporteddocs","📄 Doc. reportados"], ...(isAdmin?[["users","👥 Gestión de Usuarios"],["backup","💾 Respaldo"],["audit","📋 Auditoría"]]:[])]
           .map(([id,label])=>(
           <button key={id} onClick={()=>{setTab(id);setPwMsg(null);setUMsg(null);setKeyMsg(null);setBkMsg(null);}} style={{padding:"7px 18px",borderRadius:7,cursor:"pointer",border:"none",background:tab===id?"#1a2a45":"transparent",color:tab===id?COLORS.primary:"#64748b",fontSize:12,fontWeight:tab===id?500:400,transition:"all 0.15s"}}>
             {label}
@@ -1920,6 +2200,11 @@ function SettingsPanel({ user, users, setUsers, setUser, watchlist, setWatchlist
                   Estado: {(!needsKey || (provSettings.apiKey||"").trim())
                     ? <span style={{color:COLORS.success}}>● {AI_PROVIDER_LABELS[prov]} configurado</span>
                     : <span style={{color:COLORS.warning}}>○ Falta la clave de {AI_PROVIDER_LABELS[prov]}</span>}
+                </div>
+                <div style={{borderTop:"1px solid #1a2540",paddingTop:12,marginTop:4}}>
+                  <div style={{...S.label,marginBottom:5}}>Clave de OCR.space (modo OCR)</div>
+                  <input style={{...S.input,fontFamily:"'JetBrains Mono',monospace"}} placeholder="Tu clave (vacío = demo 'helloworld')" value={aic.ocrSpaceKey||""} onChange={e=>setAiConfig({ ...aic, ocrSpaceKey: e.target.value })}/>
+                  <div style={{fontSize:10,color:"#64748b",marginTop:4}}>Gratis en ocr.space/ocrapi. Sin clave propia usa la demo pública (compartida y limitada).</div>
                 </div>
               </div>
             </div>
@@ -1994,6 +2279,74 @@ function SettingsPanel({ user, users, setUsers, setUser, watchlist, setWatchlist
                     <div style={{fontSize:11,color:"#475569",marginTop:2}}>{w.reason||"Sin motivo"} · {w.createdBy||""}</div>
                   </div>
                   <button onClick={()=>removeWatch(w.id)} style={{...S.btn("danger"),padding:"5px 8px"}} title="Quitar"><Trash2 size={13}/></button>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── TAB: DOCUMENTOS REPORTADOS ────────────────────────────────────── */}
+      {tab==="reporteddocs"&&(
+        <div style={{...S.row,alignItems:"flex-start"}}>
+          <div style={{flex:"0 0 360px"}}>
+            <div style={S.card}>
+              <div style={{...S.h2,marginBottom:4}}>Reportar un documento</div>
+              <div style={{fontSize:12,color:"#64748b",marginBottom:16}}>
+                Registro local de documentos robados, perdidos o invalidados. El scanner alertará si se lee uno de estos números.
+              </div>
+              <div style={{display:"flex",flexDirection:"column",gap:12}}>
+                <div>
+                  <div style={{...S.label,marginBottom:5}}>Número de documento</div>
+                  <input style={{...S.input,fontFamily:"'JetBrains Mono',monospace"}} placeholder="Ej: AF0002266" value={rdForm.docNumber} onChange={e=>setRdForm(p=>({...p,docNumber:e.target.value}))}/>
+                </div>
+                <div>
+                  <div style={{...S.label,marginBottom:5}}>Estado</div>
+                  <select style={S.select} value={rdForm.type} onChange={e=>setRdForm(p=>({...p,type:e.target.value}))}>{REPORTED_TYPES.map(t=><option key={t} value={t}>{t}</option>)}</select>
+                </div>
+                <div>
+                  <div style={{...S.label,marginBottom:5}}>Titular (opcional)</div>
+                  <input style={S.input} placeholder="Nombre del titular" value={rdForm.name} onChange={e=>setRdForm(p=>({...p,name:e.target.value}))}/>
+                </div>
+                <div>
+                  <div style={{...S.label,marginBottom:5}}>Motivo / referencia</div>
+                  <input style={S.input} placeholder="Ej: Reporte policial #123" value={rdForm.reason} onChange={e=>setRdForm(p=>({...p,reason:e.target.value}))}/>
+                </div>
+                <button onClick={addReported} style={{...S.btn(),justifyContent:"center"}}><Plus size={14}/>Registrar documento</button>
+                <div style={{borderTop:"1px solid #1a2540",paddingTop:12,marginTop:2}}>
+                  <div style={{...S.label,marginBottom:6}}>Carga masiva (Excel / CSV)</div>
+                  <input ref={rdFileRef} type="file" accept=".xlsx,.xls,.csv" style={{display:"none"}} onChange={e=>{ const f=e.target.files[0]; importReported(f); e.target.value=""; }}/>
+                  <div style={{display:"flex",gap:8}}>
+                    <button onClick={()=>rdFileRef.current&&rdFileRef.current.click()} style={{...S.btn("ghost"),justifyContent:"center",flex:1}}><UploadCloud size={14}/>Importar archivo</button>
+                    <button onClick={downloadReportedTemplate} style={{...S.btn("ghost"),padding:"8px 12px"}} title="Descargar plantilla"><FileText size={14}/>Plantilla</button>
+                  </div>
+                  {rdMsg&&<div style={{marginTop:8,background:rdMsg.type==="ok"?COLORS.success+"18":"#ef444415",border:"1px solid "+(rdMsg.type==="ok"?COLORS.success+"40":"#ef444430"),borderRadius:8,padding:"7px 10px",fontSize:11,color:rdMsg.type==="ok"?COLORS.success:"#ef4444"}}>{rdMsg.text}</div>}
+                  <div style={{fontSize:10,color:"#64748b",marginTop:6,lineHeight:1.5}}>Columnas: documento, tipo, titular, motivo. Descarga la plantilla para el formato exacto.</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div style={{flex:1}}>
+            <div style={S.card}>
+              <div style={{...S.flex,marginBottom:16,justifyContent:"space-between"}}>
+                <div style={S.h2}>Documentos reportados ({(reportedDocs||[]).length})</div>
+                <div style={S.badge(COLORS.danger)}><FileText size={11}/>Registro local</div>
+              </div>
+              {(reportedDocs||[]).length===0 && <div style={{fontSize:12,color:"#475569",padding:"12px 0"}}>No hay documentos reportados. Registra los robados, perdidos o invalidados.</div>}
+              {(reportedDocs||[]).map(rd=>(
+                <div key={rd.id} style={{display:"flex",alignItems:"center",gap:12,padding:"12px 0",borderBottom:"1px solid #1a2540"}}>
+                  <div style={{width:34,height:34,borderRadius:8,background:COLORS.danger+"20",border:"1px solid "+COLORS.danger+"30",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
+                    <FileText size={15} color={COLORS.danger}/>
+                  </div>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{fontSize:13,color:"#e2e8f0",fontWeight:500,display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                      <span style={{fontFamily:"'JetBrains Mono',monospace",color:COLORS.primary}}>{rd.docNumber}</span>
+                      <span style={{...S.badge(COLORS.danger),textTransform:"uppercase"}}>{rd.type}</span>
+                      {rd.name&&<span style={{fontSize:12,color:"#94a3b8"}}>{rd.name}</span>}
+                    </div>
+                    <div style={{fontSize:11,color:"#475569",marginTop:2}}>{rd.reason||"Sin motivo"} · {rd.createdBy||""}</div>
+                  </div>
+                  <button onClick={()=>removeReported(rd.id)} style={{...S.btn("danger"),padding:"5px 8px"}} title="Quitar"><Trash2 size={13}/></button>
                 </div>
               ))}
             </div>
@@ -2336,6 +2689,7 @@ const LS_KEYS = {
   persons: "aeromap_persons",
   watchlist: "aeroreport_watchlist",
   savedMaps: "aeromap_saved_maps",
+  reporteddocs: "aeroreport_reporteddocs",
 };
 
 async function persistSave(key, value) {
@@ -2372,6 +2726,7 @@ async function collectFromLocalStorage() {
   const counter   = loadFromStorage(LS_KEYS.counter, null);
   const watchlist = loadFromStorage(LS_KEYS.watchlist, null);
   const savedMaps = loadFromStorage(LS_KEYS.savedMaps, null);
+  const reporteddocs = loadFromStorage(LS_KEYS.reporteddocs, null);
   // Migra la clave vieja de Anthropic (si existía en localStorage) a la nueva config
   let oldKey = "";
   try { oldKey = (localStorage.getItem("aeroreport_anthropic_key") || "").trim(); } catch(e) {}
@@ -2384,6 +2739,7 @@ async function collectFromLocalStorage() {
     counter: counter || 0,
     watchlist: watchlist || [],
     savedMaps: savedMaps || [],
+    reporteddocs: reporteddocs || [],
     audit: [],
     aiconfig,
   };
@@ -2397,6 +2753,7 @@ function clearSensitiveLocalStorage() {
     localStorage.removeItem(LS_KEYS.counter);
     localStorage.removeItem(LS_KEYS.watchlist);
     localStorage.removeItem(LS_KEYS.savedMaps);
+    localStorage.removeItem(LS_KEYS.reporteddocs);
     localStorage.removeItem("aeroreport_anthropic_key");
   } catch(e) {}
 }
@@ -2416,6 +2773,7 @@ async function bootstrapData() {
         await persistSave("counter", migrated.counter);
         await persistSave("watchlist", migrated.watchlist);
         await persistSave("savedMaps", migrated.savedMaps);
+        await persistSave("reporteddocs", migrated.reporteddocs);
         await persistSave("audit", migrated.audit);
         await persistSave("aiconfig", migrated.aiconfig);
         clearSensitiveLocalStorage();
@@ -2429,6 +2787,7 @@ async function bootstrapData() {
         counter: data.counter || 0,
         watchlist: data.watchlist || [],
         savedMaps: data.savedMaps || [],
+        reporteddocs: data.reporteddocs || [],
         audit: data.audit || [],
         aiconfig: normalizeAIConfig(data.aiconfig),
       };
@@ -2447,12 +2806,14 @@ export default function App() {
   const [persons, setPersons] = useState([]);
   const [watchlist, setWatchlist] = useState([]);
   const [savedMaps, setSavedMaps] = useState([]);
+  const [reportedDocs, setReportedDocs] = useState([]);
   const [audit, setAudit] = useState([]);
   const [aiConfig, setAiConfig] = useState(DEFAULT_AI);
   const [dataLoaded, setDataLoaded] = useState(false);
   const [theme, setTheme] = useState('dark');
   const [pwaInstallable, setPwaInstallable] = useState(false);
   const [saveIndicator, setSaveIndicator] = useState(false);
+  const [showNotif, setShowNotif] = useState(false);
   const printRef = useRef(null);
 
   // ─── Carga inicial de datos (store cifrado / migración) ───────────────────
@@ -2467,6 +2828,7 @@ export default function App() {
       setReportCounter(d.counter);
       setWatchlist(d.watchlist);
       setSavedMaps(d.savedMaps || []);
+      setReportedDocs(d.reporteddocs || []);
       setAudit(d.audit || []);
       setAiConfig(normalizeAIConfig(d.aiconfig));
       setModuleAI(normalizeAIConfig(d.aiconfig));
@@ -2514,6 +2876,12 @@ export default function App() {
     persistSave("savedMaps", savedMaps);
   }, [savedMaps, dataLoaded]);
 
+  // ─── Auto-guardar documentos reportados ──────────────────────────────────
+  useEffect(() => {
+    if (!dataLoaded) return;
+    persistSave("reporteddocs", reportedDocs);
+  }, [reportedDocs, dataLoaded]);
+
   // ─── Auto-guardar registro de auditoría ──────────────────────────────────
   useEffect(() => {
     if (!dataLoaded) return;
@@ -2552,6 +2920,18 @@ export default function App() {
     return () => window.removeEventListener('pwa-installable', handler);
   }, []);
 
+  // ─── Bloqueo de sesión por inactividad (15 min) ───────────────────────────
+  useEffect(() => {
+    if (!user) return;
+    const TIMEOUT = 15 * 60 * 1000;
+    let timer;
+    const reset = () => { clearTimeout(timer); timer = setTimeout(() => { setUser(null); setShowNotif(false); setPage("dashboard"); }, TIMEOUT); };
+    const events = ["mousemove", "keydown", "mousedown", "touchstart", "scroll"];
+    events.forEach(e => window.addEventListener(e, reset, { passive: true }));
+    reset();
+    return () => { clearTimeout(timer); events.forEach(e => window.removeEventListener(e, reset)); };
+  }, [user]);
+
   if (!dataLoaded) return (
     <div style={{display:"flex",height:"100vh",alignItems:"center",justifyContent:"center",background:"#080c18",color:"#64748b",flexDirection:"column",gap:14,fontFamily:"'Inter',sans-serif"}}>
       <div style={{fontSize:34}}>✈</div>
@@ -2574,17 +2954,28 @@ export default function App() {
     setReportCounter(d.counter||0);
     setWatchlist(d.watchlist||[]);
     setSavedMaps(d.savedMaps||[]);
+    setReportedDocs(d.reporteddocs||[]);
     if (d.aiconfig) setAiConfig(normalizeAIConfig(d.aiconfig));
   };
 
+  const notifications = buildNotifications(incidents, watchlist, reportedDocs);
+
+  // Rostros registrados (de informes y del mapa) para el cotejo biométrico
+  const knownFaces = [];
+  incidents.forEach(inc => {
+    const ppl = (inc.persons && inc.persons.length) ? inc.persons : (inc.person ? [inc.person] : []);
+    ppl.forEach(p => { if (p.personPhoto) knownFaces.push({ name: p.fullName || ((p.firstName||"")+" "+(p.lastName||"")).trim(), docNumber: p.documentNumber, photo: p.personPhoto, source: "informe" }); });
+  });
+  (persons||[]).forEach(m => { if (m.photo) knownFaces.push({ name: m.name, docNumber: m.docNumber, photo: m.photo, source: "mapa" }); });
+
   const pages = {
     dashboard: <Dashboard incidents={incidents}/>,
-    incidents:  <IncidentForm incidents={incidents} setIncidents={setIncidents} onViewReport={handleViewReport} logAudit={logAudit}/>,
+    incidents:  <IncidentForm incidents={incidents} setIncidents={setIncidents} onViewReport={handleViewReport} logAudit={logAudit} watchlist={watchlist} mapPersons={persons}/>,
     persons:    <PersonDossier incidents={incidents} onViewReport={handleViewReport}/>,
-    networkMap: <Suspense fallback={<div style={{padding:40,color:"#64748b",fontSize:13}}>Cargando mapa…</div>}><NetworkMap persons={persons} setPersons={setPersons} incidents={incidents} theme={theme} setTheme={setTheme} savedMaps={savedMaps} setSavedMaps={setSavedMaps} aiResolved={resolveActiveAI(aiConfig)}/></Suspense>,
-    scanner:    <OCRScanner watchlist={watchlist}/>,
+    networkMap: <Suspense fallback={<div style={{padding:40,color:"#64748b",fontSize:13}}>Cargando mapa…</div>}><NetworkMap persons={persons} setPersons={setPersons} incidents={incidents} theme={theme} setTheme={setTheme} savedMaps={savedMaps} setSavedMaps={setSavedMaps} aiResolved={resolveActiveAI(aiConfig)} watchlist={watchlist}/></Suspense>,
+    scanner:    <OCRScanner watchlist={watchlist} reportedDocs={reportedDocs} knownFaces={knownFaces}/>,
     reports:    <ReportGenerator incidents={incidents} user={user} reportCounter={reportCounter} setReportCounter={setReportCounter} onPrintInc={printRef}/>,
-    settings:   <SettingsPanel user={user} users={users} setUsers={setUsers} setUser={setUser} watchlist={watchlist} setWatchlist={setWatchlist} onDataRestored={handleDataRestored} audit={audit} logAudit={logAudit} aiConfig={aiConfig} setAiConfig={setAiConfig}/>,
+    settings:   <SettingsPanel user={user} users={users} setUsers={setUsers} setUser={setUser} watchlist={watchlist} setWatchlist={setWatchlist} onDataRestored={handleDataRestored} audit={audit} logAudit={logAudit} aiConfig={aiConfig} setAiConfig={setAiConfig} reportedDocs={reportedDocs} setReportedDocs={setReportedDocs}/>,
   };
 
   return (
@@ -2633,7 +3024,43 @@ export default function App() {
               ⬇ Instalar App
             </button>
           )}
-          <div style={{width:32,height:32,borderRadius:"50%",background:"#1a2a45",display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer"}}><Bell size={13} color="#64748b"/></div>
+          <div style={{position:"relative"}}>
+            <div onClick={()=>setShowNotif(s=>!s)} title="Notificaciones" style={{width:32,height:32,borderRadius:"50%",background:"#1a2a45",display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",position:"relative",border:showNotif?"1px solid "+COLORS.primary:"1px solid transparent"}}>
+              <Bell size={13} color={notifications.length?COLORS.primary:"#64748b"}/>
+              {notifications.length>0&&(
+                <span style={{position:"absolute",top:-4,right:-4,minWidth:16,height:16,padding:"0 4px",borderRadius:8,background:COLORS.danger,color:"#fff",fontSize:9,fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center"}}>{notifications.length>99?"99+":notifications.length}</span>
+              )}
+            </div>
+            {showNotif&&(
+              <>
+                <div onClick={()=>setShowNotif(false)} style={{position:"fixed",inset:0,zIndex:1500}}/>
+                <div className="fade-in" style={{position:"absolute",top:42,right:0,width:344,maxHeight:460,overflow:"auto",background:"#0d1426",border:"1px solid #1e2d4a",borderRadius:10,boxShadow:"0 10px 34px rgba(0,0,0,0.55)",zIndex:1600}}>
+                  <div style={{padding:"12px 14px",borderBottom:"1px solid #1e2d4a",display:"flex",justifyContent:"space-between",alignItems:"center",position:"sticky",top:0,background:"#0d1426"}}>
+                    <div style={{fontSize:13,fontWeight:600,color:"#e2e8f0"}}>Notificaciones</div>
+                    <div style={S.badge(notifications.length?COLORS.danger:"#64748b")}>{notifications.length}</div>
+                  </div>
+                  {notifications.length===0&&<div style={{padding:28,textAlign:"center",fontSize:12,color:"#475569"}}>Sin alertas pendientes</div>}
+                  {notifications.map(n=>{
+                    const col = n.kind==="watchlist"?COLORS.danger:n.severity==="Crítica"?"#c026d3":n.kind==="escalated"?COLORS.warning:COLORS.danger;
+                    return (
+                      <div key={n.id} onClick={()=>{
+                        const inc = incidents.find(i=>i.id===n.incidentId);
+                        setShowNotif(false);
+                        if (inc) { const w = window.open("","_blank","width=820,height=900"); if (w) { w.document.write(buildIncidentWindowHTML(inc)); w.document.close(); } }
+                      }} style={{padding:"10px 14px",borderBottom:"1px solid #141d33",cursor:"pointer",display:"flex",gap:10,alignItems:"flex-start"}}>
+                        <div style={{width:8,height:8,borderRadius:"50%",background:col,marginTop:5,flexShrink:0}}/>
+                        <div style={{flex:1,minWidth:0}}>
+                          <div style={{fontSize:12,color:"#e2e8f0",fontWeight:500}}>{n.title}</div>
+                          <div style={{fontSize:11,color:"#64748b",marginTop:2}}>{n.subtitle}</div>
+                        </div>
+                        <ChevronRight size={13} color="#475569" style={{flexShrink:0,marginTop:2}}/>
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
+            )}
+          </div>
         </div>
         <div style={S.content}>{pages[page]}</div>
       </div>

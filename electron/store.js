@@ -12,7 +12,7 @@ const crypto = require('crypto')
 const DATA_DIR = path.join(app.getPath('userData'), 'data')
 
 // Claves de datos permitidas (evita escribir archivos arbitrarios desde el renderer)
-const KEYS = ['incidents', 'users', 'persons', 'counter', 'watchlist', 'savedMaps', 'audit', 'aiconfig']
+const KEYS = ['incidents', 'users', 'persons', 'counter', 'watchlist', 'savedMaps', 'audit', 'aiconfig', 'reporteddocs']
 
 function ensureDir() {
   try { fs.mkdirSync(DATA_DIR, { recursive: true }) } catch (e) {}
